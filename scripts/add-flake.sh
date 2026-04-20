@@ -5,7 +5,7 @@
 #   bash scripts/add-flake.sh [OPTIONS] [REPO]
 #
 # REPO can be any of:
-#   nixbar                           → assumes github:FT-nixforge/nixbar
+#   nixbar                           → assumes github:<you>/nixbar  (detected from gh/git)
 #   FT-nixforge/nixbar
 #   github:FT-nixforge/nixbar
 #   https://github.com/FT-nixforge/nixbar
@@ -42,6 +42,19 @@ ok()    { echo -e "${GREEN}✓${NC} $*"; }
 warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
 ask()   { echo -e "${BOLD}?${NC} $*"; }
 vecho() { $VERBOSE && echo -e "${BLUE}[verbose]${NC} $*" >&2 || true; }
+
+# ── Detect GitHub username ────────────────────────────────────────────────────
+# Tries (in order):  gh CLI → git config github.user → git config user.name → ""
+get_github_username() {
+  if command -v gh &>/dev/null; then
+    local u
+    u="$(gh api user --jq '.login' 2>/dev/null)" && [[ -n "$u" ]] && { echo "$u"; return; }
+  fi
+  local u
+  u="$(git config --global github.user 2>/dev/null)" && [[ -n "$u" ]] && { echo "$u"; return; }
+  u="$(git config --global user.name 2>/dev/null)"  && [[ -n "$u" ]] && { echo "$u"; return; }
+  echo ""
+}
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in curl jq python3; do
@@ -207,8 +220,16 @@ elif [[ "$RAW_INPUT" =~ ^([^/]+)/([^/]+)$ ]]; then
   OWNER="${BASH_REMATCH[1]}"
   REPO_NAME="${BASH_REMATCH[2]}"
 elif [[ "$RAW_INPUT" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-  OWNER="FT-nixforge"
   REPO_NAME="$RAW_INPUT"
+  DETECTED_USER="$(get_github_username)"
+  if [[ -n "$DETECTED_USER" ]]; then
+    OWNER="$DETECTED_USER"
+    vecho "Detected GitHub user: $DETECTED_USER"
+  else
+    ask "Could not detect your GitHub username. Enter the owner/org for '${REPO_NAME}':"
+    read -r OWNER
+    [[ -n "$OWNER" ]] || die "Owner is required when using a bare repo name."
+  fi
 else
   die "Cannot parse repo: '$RAW_INPUT'"
 fi
