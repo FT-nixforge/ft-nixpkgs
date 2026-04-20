@@ -34,6 +34,7 @@ from pathlib import Path
 EXCLUDED = {"_template"}
 SCHEMA_VERSION = 1
 CACHE_FILE = ".registry-cache.json"
+_VERBOSE = False  # set to True by --verbose flag in main()
 
 
 # ── Nix evaluation ────────────────────────────────────────────────────────────
@@ -45,17 +46,20 @@ def eval_meta(flake_path: Path, eval_nix: Path) -> "tuple[dict | None, str | Non
     Returns (meta_dict, None) on success or (None, error_message) on failure.
     Does NOT exit — lets the caller decide how to handle errors.
     """
+    cmd = [
+        "nix",
+        "eval",
+        "--json",
+        "--file",
+        str(eval_nix),
+        "--arg",
+        "flakePath",
+        str(flake_path.resolve()),
+    ]
+    if _VERBOSE:
+        print(f"  [verbose] {' '.join(cmd)}", file=sys.stderr)
     result = subprocess.run(
-        [
-            "nix",
-            "eval",
-            "--json",
-            "--file",
-            str(eval_nix),
-            "--arg",
-            "flakePath",
-            str(flake_path.resolve()),
-        ],
+        cmd,
         capture_output=True,
         text=True,
     )
@@ -135,6 +139,8 @@ def _eval_entry(
     current_hash = _file_hash(nix_path)
     cached = cache.get(str(nix_path))
     if cached and cached.get("hash") == current_hash:
+        if _VERBOSE:
+            print(f"  [verbose] cache hit: {nix_path}", file=sys.stderr)
         return family, name, nix_path, cached["meta"], None, current_hash, True
 
     meta, err = eval_meta(nix_path, eval_nix)
@@ -148,7 +154,7 @@ def scan_flakes(
     flakes_dir: Path,
     eval_nix: Path,
     cache: dict,
-    max_workers: int = 8,
+    max_workers: int = 4,
 ) -> "tuple[dict, dict, list[str], dict]":
     """
     Discover and evaluate all flake configs in parallel.
@@ -248,6 +254,8 @@ def _atomic_write(path: Path, content: str) -> None:
     try:
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, path)
+        if _VERBOSE:
+            print(f"  [verbose] wrote {len(content)} bytes → {path}", file=sys.stderr)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -289,6 +297,8 @@ def write_yaml(registry: dict, path: Path) -> None:
 
 
 def main() -> None:
+    global _VERBOSE
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--repo-root",
@@ -301,7 +311,14 @@ def main() -> None:
         default=8,
         help="Number of parallel nix eval workers (default: 8)",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Print debug info (nix eval commands, cache hits, byte counts)",
+    )
     args = parser.parse_args()
+
+    _VERBOSE = args.verbose
 
     script_dir = Path(__file__).parent
     repo_root = Path(args.repo_root) if args.repo_root else script_dir.parent

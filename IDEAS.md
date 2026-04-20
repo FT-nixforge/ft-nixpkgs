@@ -5,54 +5,6 @@ ideas. Roughly ordered by impact within each section.
 
 ---
 
-## Developer Experience
-
-### `nix run .#add-flake` — expose the script as a flake app
-Wrap `add-flake.sh` as a proper flake output so users can run it without cloning the repo:
-```bash
-nix run github:FT-nixforge/ft-nixpkgs#add-flake -- FT-nixforge/nixbar
-```
-In `flake.nix`:
-```nix
-apps.x86_64-linux.add-flake = {
-  type = "app";
-  program = "${pkgs.writeShellApplication { name = "add-flake"; ... }}/bin/add-flake";
-};
-```
-
-### `nix run .#gen-registry` — expose the registry generator as a flake app
-Same idea: users and CI can run `nix run .#gen-registry` without needing Python or
-PyYAML installed globally — the flake provides the right environment.
-
-### Dev shell with all tooling
-Add a `devShells.default` to `flake.nix` that includes:
-```nix
-devShells.default = pkgs.mkShell {
-  packages = [ pkgs.python3Packages.pyyaml pkgs.jq pkgs.curl pkgs.nix ];
-};
-```
-Then contributors just run `nix develop` and everything needed for scripts is available.
-
-### `--dry-run` flag for `add-flake.sh`
-Before making any file changes, let the user preview what would happen: which files
-would be created, what the input line looks like, what the registry would contain.
-Useful for verifying behaviour against unknown repos before committing.
-
-### Verbose/debug mode for `gen-registry.py` and `add-flake.sh`
-Add a `-v` / `--verbose` flag that prints the full `nix eval` commands being run,
-the raw JSON being parsed, and the exact file writes being performed. Invaluable for
-debugging a broken flake config without guessing.
-
-### Better error messages from `mkFlake.nix`
-Nix's default error messages for missing attributes are opaque. Add explicit `throw`
-with context:
-```nix
-cfg or (throw "ft-nixpkgs: no config found for flake '${name}'")
-```
-And when a config doesn't return the expected shape, surface the flake name in the error.
-
----
-
 ## New Features
 
 ### Dependency validation at eval time

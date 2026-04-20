@@ -2,7 +2,7 @@
 # add-flake.sh — interactively add a public GitHub flake to ft-nixpkgs
 #
 # Usage:
-#   bash scripts/add-flake.sh [REPO]
+#   bash scripts/add-flake.sh [OPTIONS] [REPO]
 #
 # REPO can be any of:
 #   nixbar                           → assumes github:FT-nixforge/nixbar
@@ -10,15 +10,25 @@
 #   github:FT-nixforge/nixbar
 #   https://github.com/FT-nixforge/nixbar
 #
+# Options:
+#   --dry-run, -n    Preview what would be created/changed without writing files
+#   --verbose, -v    Print debug info (curl commands, raw JSON, file sizes)
+#   --help, -h       Show this help text
+#
 # The target repo must have a ft-nixpkgs.json file in its root.
 # See scripts/ft-nixpkgs.example.json for the expected format.
+#
+# Environment:
+#   FT_REPO_ROOT  Override the ft-nixpkgs repo root (set automatically by
+#                 `nix run .#add-flake`; defaults to the script's parent dir)
 #
 # Dependencies: curl, jq, python3
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# FT_REPO_ROOT lets `nix run .#add-flake` point at the caller's checkout.
+REPO_ROOT="${FT_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FLAKES_DIR="$REPO_ROOT/flakes"
 FLAKE_NIX="$REPO_ROOT/flake.nix"
 
@@ -26,11 +36,12 @@ FLAKE_NIX="$REPO_ROOT/flake.nix"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
-die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
-info() { echo -e "${BLUE}→${NC} $*"; }
-ok()   { echo -e "${GREEN}✓${NC} $*"; }
-warn() { echo -e "${YELLOW}⚠${NC} $*"; }
-ask()  { echo -e "${BOLD}?${NC} $*"; }
+die()   { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+info()  { echo -e "${BLUE}→${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+ask()   { echo -e "${BOLD}?${NC} $*"; }
+vecho() { $VERBOSE && echo -e "${BLUE}[verbose]${NC} $*" >&2 || true; }
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in curl jq python3; do
@@ -143,9 +154,41 @@ validate_meta() {
   fi
 }
 
+# ── Argument parsing ──────────────────────────────────────────────────────────
+DRY_RUN=false
+VERBOSE=false
+POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run|-n)
+      DRY_RUN=true
+      shift
+      ;;
+    --verbose|-v)
+      VERBOSE=true
+      shift
+      ;;
+    --help|-h)
+      sed -n '2,/^[^#]/{ /^#/{ s/^# \?//; p }; /^[^#]/q }' "$0"
+      exit 0
+      ;;
+    -*)
+      die "Unknown option: $1 (try --help)"
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+$DRY_RUN && warn "Dry-run mode — no files will be written."
+vecho "Repo root: $REPO_ROOT"
+
 # ── Parse repo argument ───────────────────────────────────────────────────────
-if [[ $# -ge 1 ]]; then
-  RAW_INPUT="$1"
+if [[ ${#POSITIONAL_ARGS[@]} -ge 1 ]]; then
+  RAW_INPUT="${POSITIONAL_ARGS[0]}"
 else
   ask "Enter the flake repo (e.g. FT-nixforge/nixbar or github:... or https://github.com/...):"
   read -r RAW_INPUT
@@ -190,6 +233,7 @@ echo ""
 
 # ── Verify flake.nix exists ───────────────────────────────────────────────────
 info "Checking for flake.nix in repo..."
+vecho "curl -s -o /dev/null -w '%{http_code}' ${RAW_BASE}/flake.nix"
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${RAW_BASE}/flake.nix")
 if [[ "$HTTP_STATUS" != "200" ]]; then
   die "No flake.nix found in ${OWNER}/${REPO_NAME} (HTTP ${HTTP_STATUS}).\nThis repo does not appear to be a Nix flake."
@@ -198,6 +242,7 @@ ok "flake.nix found"
 
 # ── Fetch ft-nixpkgs.json ─────────────────────────────────────────────────────
 info "Fetching ft-nixpkgs.json..."
+vecho "curl -s -f ${RAW_BASE}/ft-nixpkgs.json"
 META_JSON=$(curl -s -f "${RAW_BASE}/ft-nixpkgs.json" 2>/dev/null || true)
 
 if [[ -z "$META_JSON" ]]; then
@@ -215,6 +260,8 @@ if [[ -z "$META_JSON" ]]; then
   META_JSON="$(collect_manual_meta)"
 else
   ok "ft-nixpkgs.json fetched"
+  vecho "Raw JSON:"
+  $VERBOSE && echo "$META_JSON" | jq . >&2 || true
 fi
 
 # ── Validate JSON ─────────────────────────────────────────────────────────────
@@ -277,14 +324,12 @@ else
   TARGET_DIR="$FLAKES_DIR/${REPO_NAME}"
 fi
 
-if [[ -d "$TARGET_DIR" ]]; then
+if [[ -d "$TARGET_DIR" ]] && ! $DRY_RUN; then
   warn "Directory already exists: $TARGET_DIR"
   ask "Overwrite? [y/N]"
   read -r OVERWRITE
   [[ "$OVERWRITE" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 fi
-
-mkdir -p "$TARGET_DIR"
 
 # ── Generate provides booleans ────────────────────────────────────────────────
 HAS_PACKAGES=false; HAS_NIXOS=false; HAS_HOME=false; HAS_LIB=false
@@ -308,12 +353,9 @@ NIX_VERSION="$(nix_escape "$FLAKE_VERSION")"
 NIX_PROVIDES="$(echo "$PROVIDES_RAW" | jq -r '[ .[] | "\"" + . + "\"" ] | "[ " + join(" ") + " ]"')"
 NIX_DEPS="$(echo "$DEPS_RAW" | jq -r '[ .[] | "\"" + . + "\"" ] | "[ " + join(" ") + " ]"')"
 
-# ── Write flakes/<folder>/default.nix ────────────────────────────────────────
-info "Writing $TARGET_DIR/default.nix..."
-
-# Use printf for the static parts and variables for the dynamic parts so that
-# shell special characters in metadata values cannot break the heredoc.
-{
+# ── Generate the default.nix content ─────────────────────────────────────────
+# Use printf so that special characters in metadata values cannot break the output.
+generate_default_nix() {
 printf '{ inputs, system, pkgsLib, ... }:\n\n'
 printf 'let\n'
 printf '  flake = inputs.%s;\n' "$INPUT_ATTR"
@@ -356,16 +398,34 @@ printf '\n  overlay = _final: prev: {\n'
 printf '    %s = (flake.packages.${prev.system} or {}).default or null;\n' "$REPO_NAME"
 printf '  };\n'
 printf '}\n'
-} > "$TARGET_DIR/default.nix"
+}
 
-ok "Wrote $TARGET_DIR/default.nix"
+# ── Write (or preview) flakes/<folder>/default.nix ───────────────────────────
+if $DRY_RUN; then
+  echo ""
+  info "[DRY RUN] Would create: ${TARGET_DIR}/default.nix"
+  echo "  ┌─────────────────────────────────────────────────────────"
+  generate_default_nix | sed 's/^/  │ /'
+  echo "  └─────────────────────────────────────────────────────────"
+else
+  info "Writing $TARGET_DIR/default.nix..."
+  mkdir -p "$TARGET_DIR"
+  generate_default_nix > "$TARGET_DIR/default.nix"
+  ok "Wrote $TARGET_DIR/default.nix"
+fi
 
-# ── Patch flake.nix — add new input ──────────────────────────────────────────
-info "Adding input to flake.nix..."
+# ── Patch (or preview) flake.nix — add new input ─────────────────────────────
+echo ""
+info "$(  $DRY_RUN && echo '[DRY RUN] Would add input to' || echo 'Adding input to') flake.nix..."
 
 if grep -qP "^\s*${INPUT_ATTR}\.url\s*=" "$FLAKE_NIX" 2>/dev/null || \
    grep -q "  ${INPUT_ATTR}\.url" "$FLAKE_NIX"; then
   warn "Input '${INPUT_ATTR}' already exists in flake.nix — skipping input patch."
+elif $DRY_RUN; then
+  echo ""
+  echo "  Would insert into flake.nix inputs block:"
+  echo "    ${INPUT_ATTR}.url = \"${FLAKE_URL}\";"
+  echo ""
 else
   python3 - "$FLAKE_NIX" "$INPUT_ATTR" "$FLAKE_URL" <<'PYEOF'
 import sys, re, os, tempfile
@@ -410,11 +470,14 @@ PYEOF
   ok "Added '${INPUT_ATTR}.url = \"${FLAKE_URL}\";' to flake.nix"
 fi
 
-# ── Regenerate registry ───────────────────────────────────────────────────────
+# ── Regenerate (or skip) registry ────────────────────────────────────────────
 echo ""
-info "Regenerating registry..."
-if [[ -f "$SCRIPT_DIR/gen-registry.py" ]]; then
-  python3 "$SCRIPT_DIR/gen-registry.py" --repo-root "$REPO_ROOT"
+if $DRY_RUN; then
+  info "[DRY RUN] Would run: python3 scripts/gen-registry.py"
+elif [[ -f "$SCRIPT_DIR/gen-registry.py" ]]; then
+  info "Regenerating registry..."
+  python3 "$SCRIPT_DIR/gen-registry.py" --repo-root "$REPO_ROOT" \
+    $($VERBOSE && echo "--verbose" || true)
   ok "Registry updated"
 else
   warn "gen-registry.py not found — run it manually to update the registry."
@@ -422,12 +485,17 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}${BOLD}Done!${NC} Flake '${FLAKE_NAME}' added to ft-nixpkgs."
-echo ""
-echo "Next steps:"
-echo "  1. Review generated file:  $TARGET_DIR/default.nix"
-echo "  2. Review patched input:   $FLAKE_NIX"
-echo "  3. nix flake update ${INPUT_ATTR}   (adds it to flake.lock)"
-echo "  4. nix flake show"
-echo "  5. Commit and push"
+if $DRY_RUN; then
+  echo -e "${YELLOW}${BOLD}Dry run complete.${NC} No files were written."
+  echo "Re-run without --dry-run to apply the changes."
+else
+  echo -e "${GREEN}${BOLD}Done!${NC} Flake '${FLAKE_NAME}' added to ft-nixpkgs."
+  echo ""
+  echo "Next steps:"
+  echo "  1. Review generated file:  $TARGET_DIR/default.nix"
+  echo "  2. Review patched input:   $FLAKE_NIX"
+  echo "  3. nix flake update ${INPUT_ATTR}   (adds it to flake.lock)"
+  echo "  4. nix flake show"
+  echo "  5. Commit and push"
+fi
 echo ""
