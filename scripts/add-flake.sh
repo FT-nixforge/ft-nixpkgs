@@ -22,7 +22,7 @@
 #   FT_REPO_ROOT  Override the ft-nixpkgs repo root (set automatically by
 #                 `nix run .#add-flake`; defaults to the script's parent dir)
 #
-# Dependencies: curl, jq, python3
+# Dependencies: curl, jq, python3 (optional — for registry regen)
 
 set -euo pipefail
 
@@ -31,6 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${FT_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FLAKES_DIR="$REPO_ROOT/flakes"
 FLAKE_NIX="$REPO_ROOT/flake.nix"
+
+# shellcheck source=tui.sh
+. "$SCRIPT_DIR/tui.sh"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -79,42 +82,62 @@ collect_manual_meta() {
   echo ""
   warn "You will be prompted for each required field."
   warn "Press Ctrl-C at any time to abort."
-  echo ""
 
-  local name type role family description provides_input deps_input status version
+  local name description version
+  local type role family status
+  local -a provides deps
 
-  ask "name (e.g. ft-nixbar):"
-  read -r name
+  # name — plain text
+  ask "name (e.g. ft-nixbar):"; read -r name
 
-  ask "type — one of: library, bundle, module, package, app:"
-  read -r type
+  # type — single-select
+  select_one "type" type  library bundle module package app
 
-  ask "role — one of: parent, child, standalone:"
-  read -r role
+  # role — single-select
+  select_one "role" role  parent child standalone
 
-  ask "family — e.g. ft-nixpalette (or leave blank for standalone):"
-  read -r family
+  # family — read existing family dirs + "standalone (no family)" as first option
+  local -a family_opts=("standalone (no family)")
+  local d
+  for d in "$FLAKES_DIR"/*/; do
+    [[ -d "$d" && ! -f "${d}default.nix" ]] && family_opts+=("$(basename "$d")")
+  done
+  local family_sel
+  select_one "family" family_sel "${family_opts[@]}"
+  [[ "$family_sel" == "standalone (no family)" ]] && family="" || family="$family_sel"
 
-  ask "description (one line):"
-  read -r description
+  # description — plain text
+  ask "description (one line):"; read -r description
 
-  ask "provides — space-separated list from: packages nixosModules homeModules lib"
-  ask "(e.g.: packages homeModules):"
-  read -r provides_input
+  # provides — multi-select
+  select_many "provides" provides  packages nixosModules homeModules lib
 
-  ask "dependencies — space-separated flake names (or leave blank):"
-  read -r deps_input
+  # dependencies — searchable multi-select from known flakes
+  local -a known_flakes=()
+  for d in "$FLAKES_DIR"/*/; do
+    [[ -f "${d}default.nix" ]] && known_flakes+=("$(basename "$d")")
+  done
+  for d in "$FLAKES_DIR"/*/*/; do
+    [[ -f "${d}default.nix" ]] && known_flakes+=("$(basename "$d")")
+  done
+  if [[ ${#known_flakes[@]} -gt 0 ]]; then
+    select_search "dependencies" deps "${known_flakes[@]}"
+  else
+    deps=()
+    warn "No flakes found in registry yet — skipping dependency selector."
+  fi
 
-  ask "status — one of: experimental, wip, stable, deprecated:"
-  read -r status
+  # status — single-select
+  select_one "status" status  experimental wip stable deprecated
 
-  ask "version (e.g. 0.1.0):"
-  read -r version
+  # version — plain text with default
+  ask "version [0.1.0]:"; read -r version
+  version="${version:-0.1.0}"
 
-  # Convert space-separated lists to JSON arrays
-  local provides_json deps_json
-  provides_json="$(echo "$provides_input" | jq -Rc '[split(" ")[] | select(length > 0)]')"
-  deps_json="$(echo "$deps_input"    | jq -Rc '[split(" ")[] | select(length > 0)]')"
+  # Build JSON output
+  local provides_json deps_json family_val
+  provides_json="$(printf '%s\n' "${provides[@]+"${provides[@]}"}" | jq -Rcs '[split("\n")[] | select(length > 0)]')"
+  deps_json="$(printf '%s\n' "${deps[@]+"${deps[@]}"}" | jq -Rcs '[split("\n")[] | select(length > 0)]')"
   family_val="$([ -n "$family" ] && echo "\"$family\"" || echo "null")"
 
   jq -n \
@@ -494,14 +517,19 @@ fi
 # ── Regenerate (or skip) registry ────────────────────────────────────────────
 echo ""
 if $DRY_RUN; then
-  info "[DRY RUN] Would run: python3 scripts/gen-registry.py"
-elif [[ -f "$SCRIPT_DIR/gen-registry.py" ]]; then
+  info "[DRY RUN] Would run: bash scripts/gen-registry.sh"
+elif [[ -f "$SCRIPT_DIR/gen-registry.sh" ]]; then
   info "Regenerating registry..."
+  bash "$SCRIPT_DIR/gen-registry.sh" --repo-root "$REPO_ROOT" \
+    $($VERBOSE && echo "--verbose" || true)
+  ok "Registry updated"
+elif [[ -f "$SCRIPT_DIR/gen-registry.py" ]]; then
+  info "Regenerating registry (via Python fallback)..."
   python3 "$SCRIPT_DIR/gen-registry.py" --repo-root "$REPO_ROOT" \
     $($VERBOSE && echo "--verbose" || true)
   ok "Registry updated"
 else
-  warn "gen-registry.py not found — run it manually to update the registry."
+  warn "gen-registry script not found — run it manually to update the registry."
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────

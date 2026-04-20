@@ -68,6 +68,20 @@
             }}/bin/add-flake";
           };
 
+          # Scaffold a new Nix flake with TUI-guided metadata collection.
+          create-flake = {
+            type    = "app";
+            program = "${pkgs.writeShellApplication {
+              name          = "create-flake";
+              runtimeInputs = [ pkgs.git pkgs.jq ];
+              text          = ''
+                FT_REPO_ROOT="''${FT_REPO_ROOT:-$PWD}"
+                export FT_REPO_ROOT
+                exec bash ${./scripts/create-flake.sh} "$@"
+              '';
+            }}/bin/create-flake";
+          };
+
           # Regenerates registry.json and registry.yaml from flakes/*/default.nix.
           gen-registry = {
             type    = "app";
