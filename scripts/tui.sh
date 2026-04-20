@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # tui.sh — arrow-key TUI helpers for ft-nixpkgs scripts
 #
 # Source this file:  . "$(dirname "${BASH_SOURCE[0]}")/tui.sh"
@@ -76,7 +76,7 @@ select_one() {
       DOWN)
         [[ $_idx -lt $(( _n - 1 )) ]] && _idx=$(( _idx + 1 ))
         ;;
-      $'\n'|'')
+      $'\n'|$'\r'|'')
         printf '\033[32m  ✓ %s: %s\033[0m\n' "$_title" "${_items[$_idx]}" >/dev/tty
         tput cnorm >/dev/tty
         _result_one="${_items[$_idx]}"
@@ -149,7 +149,7 @@ select_many() {
           _sel[$_idx]=1
         fi
         ;;
-      $'\n'|'')
+      $'\n'|$'\r'|'')
         _result_many=()
         local _i=0
         for _item in "${_items[@]}"; do
@@ -189,7 +189,7 @@ select_search() {
     _sel+=( 0 )
     _i=$(( _i + 1 ))
   done
-  local _prev_lines=2
+  local _prev_lines=0
   local KEY
 
   printf '\n' >/dev/tty
@@ -272,7 +272,7 @@ select_search() {
         fi
         _idx=0
         ;;
-      $'\n'|'')
+      $'\n'|$'\r'|'')
         # Erase
         printf '\033[%dA\033[J' "$_prev_lines" >/dev/tty
         _result_search=()
