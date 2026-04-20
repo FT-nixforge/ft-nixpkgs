@@ -5,6 +5,10 @@
 { inputs, pkgsLib }:
 
 let
+  # Parse registry.json exactly once — all attrs below close over the same
+  # `data` binding so builtins.fromJSON is never called more than once per
+  # evaluation.  Keep these three lines together; don't inline the fromJSON call
+  # into individual attrs or the parse will be duplicated.
   data     = builtins.fromJSON (builtins.readFile ./registry.json);
   flakes   = data.flakes;
   families = data.families;

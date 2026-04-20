@@ -110,18 +110,39 @@ let
         in acc // ((result.overlay or (_f: _p: {})) final prev)
       ) {} (pkgsLib.mapAttrsToList pkgsLib.nameValuePair flakeConfigs);
 
+  # Build a per-flake named overlay attrset so callers can use individual overlays
+  # instead of the fully-composed default.  Each overlay is a separate function
+  # so nixpkgs applies only the ones the user includes (lazy composition):
+  #
+  #   nixpkgs.overlays = [ ft-nixpkgs.overlays.nixpalette ]
+  #   nixpkgs.overlays = builtins.attrValues (removeAttrs ft-nixpkgs.overlays ["default"])
+  mkNamedOverlays = { flakeConfigs }:
+    pkgsLib.mapAttrs (name: cfg:
+      final: prev:
+        let result = callFlakeConfig name cfg { inherit inputs pkgsLib; system = prev.system; };
+        in (result.overlay or (_f: _p: {})) final prev
+    ) flakeConfigs;
+
   # Produce the full flake outputs attrset.
   # Pass systems = lib.defaultSystems ++ [ "aarch64-darwin" ] to extend.
   mkAggregatedOutputs = { flakeConfigs, systems ? defaultSystems }:
+    let
+      namedOverlays = mkNamedOverlays { inherit flakeConfigs; };
+    in
     {
       packages     = pkgsLib.genAttrs systems (system: mkPackages { inherit flakeConfigs system; });
       nixosModules = mkNixosModules { inherit flakeConfigs; };
       homeModules  = mkHomeModules  { inherit flakeConfigs; };
-      overlays.default = mkOverlay  { inherit flakeConfigs; };
+      # overlays.<name>   — individual per-flake overlays (lazily evaluated)
+      # overlays.default  — all overlays composed together (backward compat)
+      overlays = namedOverlays // {
+        default = mkOverlay { inherit flakeConfigs; };
+      };
     };
 
 in
 {
   inherit defaultSystems loadFlakeConfigs callFlakeConfig
-          mkPackages mkNixosModules mkHomeModules mkOverlay mkAggregatedOutputs;
+          mkPackages mkNixosModules mkHomeModules
+          mkOverlay mkNamedOverlays mkAggregatedOutputs;
 }
