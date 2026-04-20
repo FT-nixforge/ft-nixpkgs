@@ -87,15 +87,11 @@
             type    = "app";
             program = "${pkgs.writeShellApplication {
               name          = "gen-registry";
-              runtimeInputs = [
-                (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
-                pkgs.nix
-              ];
+              runtimeInputs = [ pkgs.nix pkgs.jq ];
               text = ''
-                exec python3 ${./scripts/gen-registry.py} --repo-root "$PWD" "$@"
+                exec bash ${./scripts/gen-registry.sh} --repo-root "$PWD" "$@"
               '';
             }}/bin/gen-registry";
-          };
         });
 
       # ── Dev shell ────────────────────────────────────────────────────────
@@ -116,10 +112,10 @@
             ];
             shellHook = ''
               echo "ft-nixpkgs dev shell — available commands:"
-              echo "  python3 scripts/gen-registry.py          # regenerate registry"
-              echo "  bash    scripts/add-flake.sh <repo>      # add a new flake"
-              echo "  python3 scripts/gen-registry.py --help"
-              echo "  bash    scripts/add-flake.sh --help"
+              echo "  bash scripts/gen-registry.sh             # regenerate registry"
+              echo "  bash scripts/add-flake.sh <repo>         # add a new flake"
+              echo "  bash scripts/gen-registry.sh --help"
+              echo "  bash scripts/add-flake.sh --help"
             '';
           };
         });
