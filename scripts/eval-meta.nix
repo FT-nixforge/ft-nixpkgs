@@ -1,13 +1,13 @@
-# Helper used by gen-registry.py to extract the `meta` attrset from a
+# Helper used by gen-registry.sh to extract the `meta` attrset from a
 # flake config function without needing real inputs or a Nix system.
 #
 # Usage:
-#   nix eval --json --file scripts/eval-meta.nix \
+#   nix-instantiate --eval --json --strict --file scripts/eval-meta.nix \
 #       --arg flakePath /abs/path/to/flakes/family/name/default.nix
 #
-# Nix is lazy, so `inputs`, `system`, and `pkgsLib` are never forced when
-# only `meta` is accessed — the function body's `let flake = inputs.X`
-# binding is never evaluated.
+# Note: use nix-instantiate (not `nix eval`) — the classic `nix` CLI correctly
+# applies --arg to top-level functions in --file mode; the experimental
+# `nix eval` command does not apply --arg to --file expressions.
 
 { flakePath }:
 let
