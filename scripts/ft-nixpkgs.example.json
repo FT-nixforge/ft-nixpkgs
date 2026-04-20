@@ -1,0 +1,22 @@
+{
+  "_comment": "Place this file as ft-nixpkgs.json in the root of your flake repo.",
+  "_comment2": "It tells ft-nixpkgs how to integrate your flake. repo is omitted — derived from the URL.",
+
+  "schemaVersion": 1,
+  "name": "ft-nixbar",
+  "type": "module",
+  "role": "standalone",
+  "family": null,
+  "description": "Unified status bar for NixOS",
+  "provides": ["packages", "homeModules"],
+  "dependencies": ["nixpalette"],
+  "status": "wip",
+  "version": "0.1.0",
+
+  "_type_values":         "library | bundle | module | package | app",
+  "_role_values":         "parent | child | standalone",
+  "_status_values":       "experimental | wip | stable | deprecated",
+  "_provides_values":     "packages | nixosModules | homeModules | lib",
+  "_family_note":         "Set to the family folder name (e.g. ft-nixpalette) if this flake belongs to a family, otherwise null",
+  "_homeModules_note":    "Script handles both homeModules and homeManagerModules output attrs automatically"
+}

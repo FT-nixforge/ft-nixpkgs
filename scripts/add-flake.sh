@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# add-flake.sh — interactively add a public GitHub flake to ft-nixpkgs
+#
+# Usage:
+#   bash scripts/add-flake.sh [REPO]
+#
+# REPO can be any of:
+#   nixbar                           → assumes github:FT-nixforge/nixbar
+#   FT-nixforge/nixbar
+#   github:FT-nixforge/nixbar
+#   https://github.com/FT-nixforge/nixbar
+#
+# The target repo must have a ft-nixpkgs.json file in its root.
+# See scripts/ft-nixpkgs.example.json for the expected format.
+#
+# Dependencies: curl, jq, python3
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FLAKES_DIR="$REPO_ROOT/flakes"
+FLAKE_NIX="$REPO_ROOT/flake.nix"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+
+die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+info() { echo -e "${BLUE}→${NC} $*"; }
+ok()   { echo -e "${GREEN}✓${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC} $*"; }
+ask()  { echo -e "${BOLD}?${NC} $*"; }
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+for cmd in curl jq python3; do
+  command -v "$cmd" &>/dev/null || die "Required tool not found: $cmd"
+done
+
+# ── Escape a string for use inside a Nix double-quoted string ─────────────────
+# Nix double-quoted strings interpolate ${...}, so we must escape:
+#   \  →  \\
+#   "  →  \"
+#   ${ →  \${
+nix_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"    # backslash first
+  s="${s//\"/\\\"}"    # double-quote
+  s="${s//\$\{/\\\${}" # ${ interpolation
+  printf '%s' "$s"
+}
+
+# ── Manual metadata collection (used when ft-nixpkgs.json is absent) ──────────
+collect_manual_meta() {
+  echo ""
+  warn "You will be prompted for each required field."
+  warn "Press Ctrl-C at any time to abort."
+  echo ""
+
+  local name type role family description provides_input deps_input status version
+
+  ask "name (e.g. ft-nixbar):"
+  read -r name
+
+  ask "type — one of: library, bundle, module, package, app:"
+  read -r type
+
+  ask "role — one of: parent, child, standalone:"
+  read -r role
+
+  ask "family — e.g. ft-nixpalette (or leave blank for standalone):"
+  read -r family
+
+  ask "description (one line):"
+  read -r description
+
+  ask "provides — space-separated list from: packages nixosModules homeModules lib"
+  ask "(e.g.: packages homeModules):"
+  read -r provides_input
+
+  ask "dependencies — space-separated flake names (or leave blank):"
+  read -r deps_input
+
+  ask "status — one of: experimental, wip, stable, deprecated:"
+  read -r status
+
+  ask "version (e.g. 0.1.0):"
+  read -r version
+
+  # Convert space-separated lists to JSON arrays
+  local provides_json deps_json
+  provides_json="$(echo "$provides_input" | jq -Rc '[split(" ")[] | select(length > 0)]')"
+  deps_json="$(echo "$deps_input"    | jq -Rc '[split(" ")[] | select(length > 0)]')"
+  family_val="$([ -n "$family" ] && echo "\"$family\"" || echo "null")"
+
+  jq -n \
+    --arg     name        "$name" \
+    --arg     type        "$type" \
+    --arg     role        "$role" \
+    --argjson family      "$family_val" \
+    --arg     description "$description" \
+    --argjson provides    "$provides_json" \
+    --argjson dependencies "$deps_json" \
+    --arg     status      "$status" \
+    --arg     version     "$version" \
+    '{name:$name, type:$type, role:$role, family:$family,
+      description:$description, provides:$provides,
+      dependencies:$dependencies, status:$status, version:$version}'
+}
+
+# ── Validate required metadata fields ────────────────────────────────────────
+validate_meta() {
+  local errors=()
+
+  [[ -z "$FLAKE_NAME" ]]    && errors+=("'name' is required")
+  [[ -z "$FLAKE_TYPE" ]]    && errors+=("'type' is required")
+  [[ -z "$FLAKE_ROLE" ]]    && errors+=("'role' is required")
+  [[ -z "$FLAKE_DESC" ]]    && errors+=("'description' is required")
+  [[ -z "$FLAKE_STATUS" ]]  && errors+=("'status' is required")
+  [[ -z "$FLAKE_VERSION" ]] && errors+=("'version' is required")
+
+  local valid_types=("library" "bundle" "module" "package" "app")
+  if [[ -n "$FLAKE_TYPE" ]] && ! printf '%s\n' "${valid_types[@]}" | grep -qx "$FLAKE_TYPE"; then
+    errors+=("'type' must be one of: ${valid_types[*]} — got: '$FLAKE_TYPE'")
+  fi
+
+  local valid_roles=("parent" "child" "standalone")
+  if [[ -n "$FLAKE_ROLE" ]] && ! printf '%s\n' "${valid_roles[@]}" | grep -qx "$FLAKE_ROLE"; then
+    errors+=("'role' must be one of: ${valid_roles[*]} — got: '$FLAKE_ROLE'")
+  fi
+
+  local valid_statuses=("experimental" "wip" "stable" "deprecated")
+  if [[ -n "$FLAKE_STATUS" ]] && ! printf '%s\n' "${valid_statuses[@]}" | grep -qx "$FLAKE_STATUS"; then
+    errors+=("'status' must be one of: ${valid_statuses[*]} — got: '$FLAKE_STATUS'")
+  fi
+
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    echo -e "${RED}Metadata validation failed:${NC}" >&2
+    for e in "${errors[@]}"; do
+      echo "  - $e" >&2
+    done
+    exit 1
+  fi
+}
+
+# ── Parse repo argument ───────────────────────────────────────────────────────
+if [[ $# -ge 1 ]]; then
+  RAW_INPUT="$1"
+else
+  ask "Enter the flake repo (e.g. FT-nixforge/nixbar or github:... or https://github.com/...):"
+  read -r RAW_INPUT
+fi
+
+RAW_INPUT="${RAW_INPUT// /}"  # strip spaces
+
+# Normalise to owner/repo
+if [[ "$RAW_INPUT" =~ ^https://github\.com/([^/]+)/([^/]+)/?$ ]]; then
+  OWNER="${BASH_REMATCH[1]}"
+  REPO_NAME="${BASH_REMATCH[2]%.git}"
+elif [[ "$RAW_INPUT" =~ ^github:([^/]+)/([^/]+)$ ]]; then
+  OWNER="${BASH_REMATCH[1]}"
+  REPO_NAME="${BASH_REMATCH[2]}"
+elif [[ "$RAW_INPUT" =~ ^([^/]+)/([^/]+)$ ]]; then
+  OWNER="${BASH_REMATCH[1]}"
+  REPO_NAME="${BASH_REMATCH[2]}"
+elif [[ "$RAW_INPUT" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  OWNER="FT-nixforge"
+  REPO_NAME="$RAW_INPUT"
+else
+  die "Cannot parse repo: '$RAW_INPUT'"
+fi
+
+FLAKE_URL="github:${OWNER}/${REPO_NAME}"
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO_NAME}/HEAD"
+
+echo ""
+info "Repo:      ${BOLD}${OWNER}/${REPO_NAME}${NC}"
+info "Flake URL: ${BOLD}${FLAKE_URL}${NC}"
+
+# Warn when adding a repo outside the FT-nixforge organisation
+if [[ "$OWNER" != "FT-nixforge" ]]; then
+  echo ""
+  warn "This repo is outside the FT-nixforge organisation."
+  warn "You are trusting metadata from an external source."
+  ask "Continue anyway? [y/N]"
+  read -r EXT_CONFIRM
+  [[ "$EXT_CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+fi
+echo ""
+
+# ── Verify flake.nix exists ───────────────────────────────────────────────────
+info "Checking for flake.nix in repo..."
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${RAW_BASE}/flake.nix")
+if [[ "$HTTP_STATUS" != "200" ]]; then
+  die "No flake.nix found in ${OWNER}/${REPO_NAME} (HTTP ${HTTP_STATUS}).\nThis repo does not appear to be a Nix flake."
+fi
+ok "flake.nix found"
+
+# ── Fetch ft-nixpkgs.json ─────────────────────────────────────────────────────
+info "Fetching ft-nixpkgs.json..."
+META_JSON=$(curl -s -f "${RAW_BASE}/ft-nixpkgs.json" 2>/dev/null || true)
+
+if [[ -z "$META_JSON" ]]; then
+  warn "No ft-nixpkgs.json found in ${OWNER}/${REPO_NAME}."
+  echo ""
+  echo "  The upstream repo should include a ft-nixpkgs.json metadata file."
+  echo "  See scripts/ft-nixpkgs.example.json for the format."
+  echo ""
+  ask "Do you want to enter the metadata manually instead? [y/N]"
+  read -r MANUAL_CONFIRM
+  if [[ ! "$MANUAL_CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 0
+  fi
+  META_JSON="$(collect_manual_meta)"
+else
+  ok "ft-nixpkgs.json fetched"
+fi
+
+# ── Validate JSON ─────────────────────────────────────────────────────────────
+if ! echo "$META_JSON" | jq -e . &>/dev/null; then
+  die "ft-nixpkgs.json is not valid JSON."
+fi
+
+jq_get() { echo "$META_JSON" | jq -r "$1 // empty"; }
+
+FLAKE_NAME="$(jq_get '.name')"
+FLAKE_TYPE="$(jq_get '.type')"
+FLAKE_ROLE="$(jq_get '.role')"
+FLAKE_FAMILY="$(jq_get '.family')"
+FLAKE_DESC="$(jq_get '.description')"
+FLAKE_STATUS="$(jq_get '.status')"
+FLAKE_VERSION="$(jq_get '.version')"
+PROVIDES_RAW="$(echo "$META_JSON" | jq -c '.provides // []')"
+DEPS_RAW="$(echo "$META_JSON" | jq -c '.dependencies // []')"
+
+# ── Validate required fields & allowed values ─────────────────────────────────
+validate_meta
+
+# ── Check schema version ──────────────────────────────────────────────────────
+FT_SCHEMA_EXPECTED=1
+SCHEMA_VER="$(echo "$META_JSON" | jq -r '.schemaVersion // "absent"')"
+if [[ "$SCHEMA_VER" != "absent" && "$SCHEMA_VER" != "$FT_SCHEMA_EXPECTED" ]]; then
+  warn "ft-nixpkgs.json has schemaVersion '${SCHEMA_VER}' but this script expects version ${FT_SCHEMA_EXPECTED}."
+  warn "Metadata parsing may be unreliable — please check for a newer version of ft-nixpkgs."
+fi
+
+# ── Derive Nix input attribute name ──────────────────────────────────────────
+INPUT_ATTR="$REPO_NAME"
+
+# ── Show parsed metadata & confirm ───────────────────────────────────────────
+echo ""
+echo -e "${BOLD}Parsed metadata:${NC}"
+echo "  name:         ${FLAKE_NAME}"
+echo "  type:         ${FLAKE_TYPE}"
+echo "  role:         ${FLAKE_ROLE}"
+echo "  family:       ${FLAKE_FAMILY:-(none — standalone)}"
+echo "  description:  ${FLAKE_DESC}"
+echo "  status:       ${FLAKE_STATUS}"
+echo "  version:      ${FLAKE_VERSION}"
+echo "  provides:     $(echo "$PROVIDES_RAW" | jq -r 'join(", ")')"
+echo "  dependencies: $(echo "$DEPS_RAW" | jq -r 'join(", ") | if . == "" then "(none)" else . end')"
+echo "  nix input:    ${INPUT_ATTR}.url = \"${FLAKE_URL}\""
+echo ""
+
+ask "Continue adding this flake? [Y/n]"
+read -r CONFIRM
+if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
+  echo "Aborted."
+  exit 0
+fi
+
+# ── Determine target directory ────────────────────────────────────────────────
+if [[ -n "$FLAKE_FAMILY" ]]; then
+  TARGET_DIR="$FLAKES_DIR/${FLAKE_FAMILY}/${REPO_NAME}"
+else
+  TARGET_DIR="$FLAKES_DIR/${REPO_NAME}"
+fi
+
+if [[ -d "$TARGET_DIR" ]]; then
+  warn "Directory already exists: $TARGET_DIR"
+  ask "Overwrite? [y/N]"
+  read -r OVERWRITE
+  [[ "$OVERWRITE" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+fi
+
+mkdir -p "$TARGET_DIR"
+
+# ── Generate provides booleans ────────────────────────────────────────────────
+HAS_PACKAGES=false; HAS_NIXOS=false; HAS_HOME=false; HAS_LIB=false
+while IFS= read -r p; do
+  case "$p" in
+    packages)     HAS_PACKAGES=true ;;
+    nixosModules) HAS_NIXOS=true ;;
+    homeModules)  HAS_HOME=true ;;
+    lib)          HAS_LIB=true ;;
+  esac
+done < <(echo "$PROVIDES_RAW" | jq -r '.[]')
+
+# ── Build escaped values for the Nix template ─────────────────────────────────
+NIX_NAME="$(nix_escape "$FLAKE_NAME")"
+NIX_TYPE="$(nix_escape "$FLAKE_TYPE")"
+NIX_ROLE="$(nix_escape "$FLAKE_ROLE")"
+NIX_DESC="$(nix_escape "$FLAKE_DESC")"
+NIX_REPO="$(nix_escape "$FLAKE_URL")"
+NIX_STATUS="$(nix_escape "$FLAKE_STATUS")"
+NIX_VERSION="$(nix_escape "$FLAKE_VERSION")"
+NIX_PROVIDES="$(echo "$PROVIDES_RAW" | jq -r '[ .[] | "\"" + . + "\"" ] | "[ " + join(" ") + " ]"')"
+NIX_DEPS="$(echo "$DEPS_RAW" | jq -r '[ .[] | "\"" + . + "\"" ] | "[ " + join(" ") + " ]"')"
+
+# ── Write flakes/<folder>/default.nix ────────────────────────────────────────
+info "Writing $TARGET_DIR/default.nix..."
+
+# Use printf for the static parts and variables for the dynamic parts so that
+# shell special characters in metadata values cannot break the heredoc.
+{
+printf '{ inputs, system, pkgsLib, ... }:\n\n'
+printf 'let\n'
+printf '  flake = inputs.%s;\n' "$INPUT_ATTR"
+printf 'in\n'
+printf '{\n'
+printf '  meta = {\n'
+printf '    name         = "%s";\n'  "$NIX_NAME"
+printf '    type         = "%s";    # library | bundle | module | package | app\n' "$NIX_TYPE"
+printf '    role         = "%s";    # parent | child | standalone\n' "$NIX_ROLE"
+printf '    description  = "%s";\n' "$NIX_DESC"
+printf '    repo         = "%s";\n' "$NIX_REPO"
+printf '    provides     = %s;\n'   "$NIX_PROVIDES"
+printf '    dependencies = %s;\n'   "$NIX_DEPS"
+printf '    status       = "%s";  # experimental | wip | stable | deprecated\n' "$NIX_STATUS"
+printf '    version      = "%s";\n' "$NIX_VERSION"
+printf '  };\n\n'
+
+if $HAS_PACKAGES; then
+  printf '  packages    = flake.packages.${system} or {};\n'
+else
+  printf '  packages    = {};\n'
+fi
+
+if $HAS_NIXOS; then
+  printf '  nixosModule = flake.nixosModules.default or null;\n'
+else
+  printf '  nixosModule = null;\n'
+fi
+
+if $HAS_HOME; then
+  printf '  # Handles both homeModules and homeManagerModules output conventions\n'
+  printf '  homeModule  = flake.homeModules.default or flake.homeManagerModules.default or null;\n'
+else
+  printf '  homeModule  = null;\n'
+fi
+
+$HAS_LIB && printf '  lib         = flake.lib or {};\n'
+
+printf '\n  overlay = _final: prev: {\n'
+printf '    %s = (flake.packages.${prev.system} or {}).default or null;\n' "$REPO_NAME"
+printf '  };\n'
+printf '}\n'
+} > "$TARGET_DIR/default.nix"
+
+ok "Wrote $TARGET_DIR/default.nix"
+
+# ── Patch flake.nix — add new input ──────────────────────────────────────────
+info "Adding input to flake.nix..."
+
+if grep -qP "^\s*${INPUT_ATTR}\.url\s*=" "$FLAKE_NIX" 2>/dev/null || \
+   grep -q "  ${INPUT_ATTR}\.url" "$FLAKE_NIX"; then
+  warn "Input '${INPUT_ATTR}' already exists in flake.nix — skipping input patch."
+else
+  python3 - "$FLAKE_NIX" "$INPUT_ATTR" "$FLAKE_URL" <<'PYEOF'
+import sys, re, os, tempfile
+
+flake_nix, input_attr, flake_url = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(flake_nix, 'r') as f:
+    content = f.read()
+
+new_line = f'    {input_attr}.url = "{flake_url}";\n'
+
+# Prefer inserting before the "# ── Planned" comment block
+marker = '    # ── Planned'
+if marker in content:
+    patched = content.replace(marker, new_line + marker, 1)
+else:
+    # Fallback: insert before the closing brace of the inputs block
+    patched = re.sub(
+        r'(  \};\n\n  outputs)',
+        new_line + r'\1',
+        content,
+        count=1,
+    )
+
+if new_line.strip() not in patched:
+    print(f"ERROR: could not locate insertion point in {flake_nix}", file=sys.stderr)
+    sys.exit(1)
+
+# Atomic write: write to a temp file then rename
+tmp = flake_nix + '.tmp'
+with open(tmp, 'w') as f:
+    f.write(patched)
+os.replace(tmp, flake_nix)
+print(f"  patched {flake_nix}")
+PYEOF
+
+  # Verify the patch actually landed
+  if ! grep -q "  ${INPUT_ATTR}\.url" "$FLAKE_NIX"; then
+    die "Patch did not apply — '${INPUT_ATTR}.url' not found in flake.nix after patching.\nPlease add the input manually:\n  ${INPUT_ATTR}.url = \"${FLAKE_URL}\";"
+  fi
+
+  ok "Added '${INPUT_ATTR}.url = \"${FLAKE_URL}\";' to flake.nix"
+fi
+
+# ── Regenerate registry ───────────────────────────────────────────────────────
+echo ""
+info "Regenerating registry..."
+if [[ -f "$SCRIPT_DIR/gen-registry.py" ]]; then
+  python3 "$SCRIPT_DIR/gen-registry.py" --repo-root "$REPO_ROOT"
+  ok "Registry updated"
+else
+  warn "gen-registry.py not found — run it manually to update the registry."
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GREEN}${BOLD}Done!${NC} Flake '${FLAKE_NAME}' added to ft-nixpkgs."
+echo ""
+echo "Next steps:"
+echo "  1. Review generated file:  $TARGET_DIR/default.nix"
+echo "  2. Review patched input:   $FLAKE_NIX"
+echo "  3. nix flake update ${INPUT_ATTR}   (adds it to flake.lock)"
+echo "  4. nix flake show"
+echo "  5. Commit and push"
+echo ""

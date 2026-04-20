@@ -81,23 +81,66 @@ Full registry with metadata, dependency graph, and family information: [`registr
 
 ## Adding a new flake
 
-1. **Publish the upstream repo** under `github:FT-nixforge/<name>`
+### Automated (recommended)
 
-2. **Add input** to `flake.nix`:
-   ```nix
-   # FT-nixforge flakes
-   nixbar.url = "github:FT-nixforge/nixbar";
-   ```
+Run the interactive script — it fetches metadata from the upstream repo and wires everything up:
 
-3. **Create config file** from the template:
-   ```bash
-   cp -r flakes/_template flakes/nixbar
-   # edit flakes/nixbar/default.nix — replace FLAKE_NAME, fill in meta
-   ```
+```bash
+bash scripts/add-flake.sh FT-nixforge/nixbar
+# or any public GitHub repo:
+bash scripts/add-flake.sh some-org/some-flake
+# or just the repo name (assumes FT-nixforge org):
+bash scripts/add-flake.sh nixbar
+```
 
-4. **Register it** in `registry.nix` and `registry.yaml`
+The script will:
+1. Fetch `ft-nixpkgs.json` from the upstream repo
+2. Create `flakes/<folder>/default.nix`
+3. Patch `flake.nix` with the new input
+4. Regenerate `registry.json` and `registry.yaml`
 
-5. Commit and push — ft-nixpkgs picks it up automatically via `loadFlakeConfigs`
+Then review, run `nix flake update <name>`, and commit.
+
+### What the upstream repo needs
+
+The upstream repo must have a `ft-nixpkgs.json` file in its root:
+
+```json
+{
+  "name": "ft-nixbar",
+  "type": "module",
+  "role": "standalone",
+  "family": null,
+  "description": "Unified status bar for NixOS",
+  "provides": ["packages", "homeModules"],
+  "dependencies": ["nixpalette"],
+  "status": "wip",
+  "version": "0.1.0"
+}
+```
+
+See `scripts/ft-nixpkgs.example.json` for the full reference.
+
+### Family flakes
+
+To add a flake to a family (e.g. a new `ft-nixpalette-*` variant), set the `family` field:
+
+```json
+{
+  "family": "ft-nixpalette",
+  "role": "child",
+  ...
+}
+```
+
+The script will automatically place it under `flakes/ft-nixpalette/<name>/`.
+
+### Manual
+
+1. Copy `flakes/_template` to `flakes/<name>/` (or `flakes/<family>/<name>/`)
+2. Fill in the `meta` block including `repo`, `provides`, `dependencies`, etc.
+3. Add the input to `flake.nix`
+4. Run `python scripts/gen-registry.py` to update the registry
 
 ---
 
@@ -107,21 +150,28 @@ Full registry with metadata, dependency graph, and family information: [`registr
 ft-nixpkgs/
 ├── flake.nix                  # Entry point; all inputs defined here
 ├── flakes/                    # Per-flake integration configs
-│   ├── nixpalette/
-│   ├── nixpalette-hyprland/
-│   ├── nixprism/
+│   ├── ft-nixpalette/         # Family folder
+│   │   ├── nixpalette/
+│   │   └── nixpalette-hyprland/
+│   ├── nixprism/              # Standalone flake
 │   └── _template/             # Copy this for new flakes
 ├── lib/
 │   ├── default.nix            # Exports all helpers
-│   ├── mkFlake.nix            # Aggregation factory
+│   ├── mkFlake.nix            # Aggregation factory (handles family folders)
 │   └── merge.nix              # Merge utilities
 ├── pkgs/default.nix           # Aggregated package set (shim)
 ├── modules/
 │   ├── nixos/default.nix      # Aggregated NixOS modules (shim)
 │   └── home/default.nix       # Aggregated Home Manager modules (shim)
 ├── overlays/default.nix       # Combined overlay (shim)
-├── registry.nix               # Machine-readable registry (Nix)
-└── registry.yaml              # Human-readable registry (YAML / Docusaurus)
+├── registry.json              # Generated — do not edit manually
+├── registry.yaml              # Generated — do not edit manually
+├── registry.nix               # Reads registry.json; exposes filter helpers
+└── scripts/
+    ├── add-flake.sh           # Interactive: add a flake from any public GitHub repo
+    ├── gen-registry.py        # Regenerate registry.json + registry.yaml
+    ├── eval-meta.nix          # Nix helper used by gen-registry.py
+    └── ft-nixpkgs.example.json # Reference format for upstream ft-nixpkgs.json
 ```
 
 ---
