@@ -10,7 +10,6 @@
 
     # ── FT-nixforge flakes ──────────────────────────────────────────────────
     ft-nixpalette.url = "github:FT-nixforge/ft-nixpalette";
-    nixprism.url      = "github:FT-nixforge/nixprism";
 
     # ── Planned (uncomment when the repo is published) ──────────────────────
     # nixui.url     = "github:FT-nixforge/nixui";
