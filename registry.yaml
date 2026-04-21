@@ -18,19 +18,4 @@ flakes:
     version: 1.0.1
     family: null
     versions: []
-  nixprism:
-    dependencies:
-    - nixpalette
-    description: Rofi app launcher
-    name: ft-nixprism
-    provides:
-    - packages
-    - homeModules
-    repo: github:FT-nixforge/nixprism
-    role: standalone
-    status: stable
-    type: module
-    version: 1.0.0
-    family: null
-    versions: []
 families: {}
