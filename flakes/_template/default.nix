@@ -4,7 +4,7 @@
 #   1. Add upstream input in flake.nix: nixbar.url = "github:FT-nixforge/nixbar";
 #   2. Copy this folder:  cp -r flakes/_template flakes/nixbar
 #   3. Fill in every TODO in this file
-#   4. Run: nix run .#gen-registry  (or python scripts/gen-registry.py)
+#   4. Run: nix run .#gen-registry
 #
 # Workflow for family flakes:
 #   1. Same as above but place folder inside the family dir, e.g. flakes/ft-nixpalette/nixbar/
@@ -25,7 +25,7 @@ in
     repo         = "github:FT-nixforge/FLAKE_NAME";
     provides     = [ "packages" "homeModules" ];  # adjust as needed
     dependencies = [];
-    status       = "experimental"; # experimental | wip | stable | deprecated
+    status       = "unstable"; # unstable | beta | stable | experimental | wip | deprecated
     version      = "0.1.0";
   };
 

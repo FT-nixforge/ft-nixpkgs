@@ -1,0 +1,207 @@
+name: Add Flake to Registry
+
+# Trigger from the GitHub UI:
+#   Actions → Add Flake to Registry → Run workflow
+#   Enter the repo name and click "Run workflow".
+#
+# The workflow will:
+#   1. Validate the repo and fetch outputs.meta via nix eval
+#   2. Run all checks (fields, not already registered, etc.)
+#   3. Generate flakes/<name>/default.nix and patch flake.nix
+#   4. Open a pull request for review
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Flake repo (e.g. FT-nixforge/ft-nixpalette or github:... or https://github.com/...)"
+        required: true
+        type: string
+      family:
+        description: "Family folder for grouped flakes — leave empty for standalone placement"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Dry run — validate and preview only, no files written and no PR created"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  add-flake:
+    name: Add ${{ inputs.repo }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # ── Step 1: parse + validate repo input ──────────────────────────────────
+      - name: Parse repo input
+        id: parse
+        env:
+          REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+
+          REPO="${REPO// /}"
+
+          if [[ "$REPO" =~ ^https://github\.com/([^/]+)/([^/]+?)(/?)$ ]]; then
+            OWNER="${BASH_REMATCH[1]}"
+            REPO_NAME="${BASH_REMATCH[2]%.git}"
+          elif [[ "$REPO" =~ ^github:([^/]+)/([^/]+)$ ]]; then
+            OWNER="${BASH_REMATCH[1]}"
+            REPO_NAME="${BASH_REMATCH[2]}"
+          elif [[ "$REPO" =~ ^([^/]+)/([^/]+)$ ]]; then
+            OWNER="${BASH_REMATCH[1]}"
+            REPO_NAME="${BASH_REMATCH[2]}"
+          else
+            echo "::error::Cannot parse repo: '$REPO'. Use owner/repo, github:owner/repo, or the full HTTPS URL."
+            exit 1
+          fi
+
+          FLAKE_URL="github:${OWNER}/${REPO_NAME}"
+          echo "owner=$OWNER"         >> "$GITHUB_OUTPUT"
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+          echo "flake_url=$FLAKE_URL" >> "$GITHUB_OUTPUT"
+          echo "✓ parsed: $FLAKE_URL"
+
+      # ── Step 2: check flake.nix exists in upstream repo ──────────────────────
+      - name: Check upstream flake.nix
+        env:
+          OWNER: ${{ steps.parse.outputs.owner }}
+          REPO_NAME: ${{ steps.parse.outputs.repo_name }}
+        run: |
+          set -euo pipefail
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://raw.githubusercontent.com/${OWNER}/${REPO_NAME}/HEAD/flake.nix")
+          if [[ "$HTTP" != "200" ]]; then
+            echo "::error::No flake.nix found in ${OWNER}/${REPO_NAME} (HTTP $HTTP). Is this a Nix flake?"
+            exit 1
+          fi
+          echo "✓ flake.nix exists"
+
+      # ── Step 3: fetch + validate outputs.meta ────────────────────────────────
+      - name: Fetch and validate metadata
+        id: meta
+        env:
+          FLAKE_URL: ${{ steps.parse.outputs.flake_url }}
+        run: |
+          set -euo pipefail
+
+          echo "Fetching: nix eval ${FLAKE_URL}#meta --json"
+          if ! META_JSON="$(nix eval "${FLAKE_URL}#meta" --json 2>&1)"; then
+            echo "::error::nix eval failed. Make sure the flake exports outputs.meta = { ... };"
+            echo "$META_JSON"
+            exit 1
+          fi
+          echo "✓ outputs.meta fetched"
+
+          # Validate required fields
+          REQUIRED=(name type role description status version)
+          for field in "${REQUIRED[@]}"; do
+            val="$(echo "$META_JSON" | jq -r --arg f "$field" '.[$f] // empty')"
+            if [[ -z "$val" ]]; then
+              echo "::error::meta.$field is missing or empty"
+              exit 1
+            fi
+          done
+          echo "✓ all required fields present"
+
+          # Validate allowed values
+          TYPE="$(echo "$META_JSON" | jq -r '.type')"
+          ROLE="$(echo "$META_JSON" | jq -r '.role')"
+          STATUS="$(echo "$META_JSON" | jq -r '.status')"
+
+          echo "library bundle module package app" | grep -qw "$TYPE" \
+            || { echo "::error::meta.type '$TYPE' is not valid (library|bundle|module|package|app)"; exit 1; }
+          echo "parent child standalone" | grep -qw "$ROLE" \
+            || { echo "::error::meta.role '$ROLE' is not valid (parent|child|standalone)"; exit 1; }
+          echo "experimental wip stable deprecated" | grep -qw "$STATUS" \
+            || { echo "::error::meta.status '$STATUS' is not valid (experimental|wip|stable|deprecated)"; exit 1; }
+          echo "✓ field values valid"
+
+          FLAKE_NAME="$(echo "$META_JSON" | jq -r '.name')"
+          echo "name=$FLAKE_NAME" >> "$GITHUB_OUTPUT"
+
+          # Multiline output via delimiter
+          {
+            echo "meta<<METAEOF"
+            echo "$META_JSON" | jq .
+            echo "METAEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── Step 4: check not already registered ─────────────────────────────────
+      - name: Check not already registered
+        env:
+          FLAKE_NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          if grep -q "  ${FLAKE_NAME}\.url\s*=" flake.nix 2>/dev/null; then
+            echo "::error::'${FLAKE_NAME}' is already registered in flake.nix"
+            exit 1
+          fi
+          if [[ -d "flakes/${FLAKE_NAME}" || -d "flakes/${{ inputs.family }}/${FLAKE_NAME}" ]]; then
+            echo "::error::flakes/${FLAKE_NAME}/ already exists in this repo"
+            exit 1
+          fi
+          echo "✓ not yet registered"
+
+      # ── Step 5: run add-flake script ─────────────────────────────────────────
+      - name: Run add-flake
+        env:
+          REPO: ${{ inputs.repo }}
+          FAMILY: ${{ inputs.family }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FT_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          ARGS=(--non-interactive)
+          [[ "$DRY_RUN" == "true" ]]  && ARGS+=(--dry-run)
+          [[ -n "$FAMILY" ]]          && ARGS+=(--family "$FAMILY")
+          bash scripts/add-flake.sh "${ARGS[@]}" "$REPO"
+
+      # ── Step 6: open pull request ─────────────────────────────────────────────
+      - name: Create pull request
+        if: ${{ !inputs.dry_run }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: add-flake/${{ steps.meta.outputs.name }}
+          delete-branch: true
+          commit-message: "feat: add ${{ steps.meta.outputs.name }} to registry"
+          title: "feat: add `${{ steps.meta.outputs.name }}` to registry"
+          labels: registry
+          body: |
+            ## Add `${{ steps.meta.outputs.name }}` to registry
+
+            Triggered by @${{ github.actor }} via the **Add Flake** workflow.
+
+            **Source flake:** `${{ steps.parse.outputs.flake_url }}`
+
+            <details><summary>Fetched metadata</summary>
+
+            ```json
+            ${{ steps.meta.outputs.meta }}
+            ```
+
+            </details>
+
+            ### Review checklist
+            - [ ] `flakes/${{ steps.meta.outputs.name }}/default.nix` looks correct
+            - [ ] `flake.nix` input entry is correct
+            - [ ] Run `nix flake update ${{ steps.meta.outputs.name }}` locally before merging
+            - [ ] `nix flake show` passes without errors

@@ -12,7 +12,7 @@ in
     repo         = "github:FT-nixforge/nixprism";
     provides     = [ "packages" "homeModules" ];
     dependencies = [ "nixpalette" ];
-    status       = "stable";    # experimental | wip | stable | deprecated
+    status       = "stable";    # unstable | beta | stable | experimental | wip | deprecated
     version      = "1.0.0";
   };
 

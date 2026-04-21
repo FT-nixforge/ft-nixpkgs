@@ -26,6 +26,30 @@ ok()    { echo -e "${GREEN}✓${NC} $*"; }
 warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
 vecho() { $VERBOSE && echo -e "${BLUE}[v]${NC} $*" >&2 || true; }
 
+nix_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\$\{/\\\$\{}"
+  printf '%s' "$s"
+}
+
+nix_list_from_array() {
+  local values=("$@")
+  if [[ ${#values[@]} -eq 0 ]]; then
+    printf '[]'
+    return
+  fi
+
+  local rendered=()
+  local value
+  for value in "${values[@]}"; do
+    rendered+=("\"$(nix_escape "$value")\"")
+  done
+
+  printf '[ %s ]' "${rendered[*]}"
+}
+
 # ── Deps ──────────────────────────────────────────────────────────────────────
 for _dep in git jq gum; do
   command -v "$_dep" &>/dev/null \
@@ -143,7 +167,7 @@ fi
 
 # 9. Status (single-select)
 CF_STATUS="$(gum choose --header "Status:" \
-  experimental wip stable deprecated)"
+  unstable beta stable experimental wip deprecated)"
 
 # 10. Version
 CF_VERSION="$(gum input \
@@ -195,95 +219,163 @@ write_file() {
 
 _has_provide() {
   local _p="$1"
-  for _item in "${CF_PROVIDES[@]+"${CF_PROVIDES[@]}"}"; do
+  for _item in "${CF_PROVIDES[@]}"; do
     [[ "$_item" == "$_p" ]] && return 0
   done
   return 1
 }
 
+_supports_floating_release_tag() {
+  case "$CF_STATUS" in
+    stable|beta|unstable) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ── flake.nix ─────────────────────────────────────────────────────────────────
 generate_flake_nix() {
-  local _out='{
-  description = "'"$CF_DESC"'";
+  local _desc _repo _provides _deps
+  _desc="$(nix_escape "$CF_DESC")"
+  _repo="$(nix_escape "github:${CF_OWNER}/${CF_NAME}")"
+  _provides="$(nix_list_from_array "${CF_PROVIDES[@]}")"
+  _deps="$(nix_list_from_array "${CF_DEPS[@]}")"
+
+  cat <<EOF
+{
+  description = "${_desc}";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";'
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+EOF
 
-  for _dep in "${CF_DEPS[@]+"${CF_DEPS[@]}"}"; do
-    _out+="
-    # ${_dep}.url = \"github:${CF_OWNER}/${_dep}\";  # TODO: verify URL"
+  local _dep
+  for _dep in "${CF_DEPS[@]}"; do
+    printf '    # %s.url = "github:%s/%s";  # TODO: verify URL\n' "$_dep" "$CF_OWNER" "$_dep"
   done
 
-  _out+='
+  cat <<EOF
   };
 
-  outputs = { self, nixpkgs, ... }: let
+  outputs = { self, nixpkgs, ... }:
+  let
     systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
     forAllSystems = nixpkgs.lib.genAttrs systems;
     pkgsFor = system: import nixpkgs { inherit system; };
-  in {'
+  in
+  {
+    meta = {
+      name         = "${CF_NAME}";
+      type         = "${CF_TYPE}";        # library | bundle | module | package | app
+      role         = "${CF_ROLE}";        # parent | child | standalone
+      description  = "${_desc}";
+      repo         = "${_repo}";
+      provides     = ${_provides};
+      dependencies = ${_deps};
+      status       = "${CF_STATUS}";      # unstable | beta | stable | experimental | wip | deprecated
+      version      = "${CF_VERSION}";
+    };
+EOF
 
   if _has_provide "packages"; then
-    _out+='
-    packages = forAllSystems (system: let pkgs = pkgsFor system; in {
-      default = pkgs.callPackage ./packages { };
-    });'
+    cat <<'EOF'
+
+    packages = forAllSystems (system:
+      let pkgs = pkgsFor system; in
+      {
+        default = pkgs.callPackage ./packages { };
+      });
+EOF
   fi
+
   if _has_provide "nixosModules"; then
-    _out+='
-    nixosModules.default = import ./modules/nixos;'
+    cat <<'EOF'
+
+    nixosModules.default = import ./modules/nixos;
+EOF
   fi
+
   if _has_provide "homeModules"; then
-    _out+='
-    homeModules.default = import ./modules/home;'
+    cat <<'EOF'
+
+    homeModules.default = import ./modules/home;
+    homeManagerModules.default = self.homeModules.default;
+EOF
   fi
+
   if _has_provide "lib"; then
-    _out+='
-    lib = import ./lib { inherit (nixpkgs) lib; };'
+    cat <<'EOF'
+
+    lib = import ./lib { inherit (nixpkgs) lib; };
+EOF
   fi
 
-  _out+='
+  cat <<'EOF'
+
+    devShells = forAllSystems (system:
+      let pkgs = pkgsFor system; in
+      {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            git
+            jq
+          ];
+        };
+      });
   };
-}'
-  printf '%s' "$_out"
 }
-
-# ── ft-nixpkgs.json ───────────────────────────────────────────────────────────
-generate_ft_nixpkgs_json() {
-  local provides_json deps_json family_val
-  provides_json="$(printf '%s\n' "${CF_PROVIDES[@]+"${CF_PROVIDES[@]}"}" \
-    | jq -Rcs '[split("\n")[] | select(length > 0)]')"
-  deps_json="$(printf '%s\n' "${CF_DEPS[@]+"${CF_DEPS[@]}"}" \
-    | jq -Rcs '[split("\n")[] | select(length > 0)]')"
-  family_val="$([ -n "$CF_FAMILY" ] && printf '"%s"' "$CF_FAMILY" || echo "null")"
-
-  jq -n \
-    --argjson schemaVersion 1 \
-    --arg name "$CF_NAME" \
-    --arg type "$CF_TYPE" \
-    --arg role "$CF_ROLE" \
-    --argjson family "$family_val" \
-    --arg description "$CF_DESC" \
-    --argjson provides "$provides_json" \
-    --argjson dependencies "$deps_json" \
-    --arg status "$CF_STATUS" \
-    --arg version "$CF_VERSION" \
-    '{schemaVersion:$schemaVersion, name:$name, type:$type, role:$role, family:$family,
-      description:$description, provides:$provides, dependencies:$dependencies,
-      status:$status, version:$version}'
+EOF
 }
 
 # ── README.md ─────────────────────────────────────────────────────────────────
 generate_readme() {
+  local _rolling_block
+  if _supports_floating_release_tag; then
+    _rolling_block="
+### Rolling (${CF_STATUS})
+\`\`\`nix
+inputs.${CF_NAME}.url = \"github:${CF_OWNER}/${CF_NAME}/${CF_STATUS}\";
+\`\`\`
+"
+  else
+    _rolling_block="
+### Rolling releases
+
+This flake only publishes floating release tags for \`stable\`, \`beta\`, and \`unstable\`.
+Current status: \`${CF_STATUS}\`.
+"
+  fi
+
   local _out="# $CF_NAME
 
 $CF_DESC
 
 ## Usage
 
+### Pinned release
 \`\`\`nix
-${CF_NAME}.url = \"github:${CF_OWNER}/${CF_NAME}\";
+inputs.${CF_NAME}.url = \"github:${CF_OWNER}/${CF_NAME}/v${CF_VERSION}\";
 \`\`\`
+
+${_rolling_block}
+
+### Bleeding edge
+\`\`\`nix
+inputs.${CF_NAME}.url = \"github:${CF_OWNER}/${CF_NAME}/main\";
+\`\`\`
+
+## Metadata
+
+\`\`\`nix
+outputs.meta = {
+  name = \"${CF_NAME}\";
+  version = \"${CF_VERSION}\";
+  status = \"${CF_STATUS}\";
+};
+\`\`\`
+
+The release workflow creates:
+- a fixed tag \`v${CF_VERSION}\`
+- a floating tag matching \`meta.status\` when the status is \`stable\`, \`beta\`, or \`unstable\`
 "
   if _has_provide "packages"; then
     _out+="
@@ -323,18 +415,307 @@ let myLib = inputs.${CF_NAME}.lib; in ...
 \`\`\`bash
 nix develop
 \`\`\`
+
+## CI / release automation
+
+- \`.github/workflows/check.yml\` validates the flake on pushes and PRs
+- \`.github/workflows/update_flake.yml\` opens a weekly \`flake.lock\` update PR
+- \`.github/workflows/release.yml\` tags and releases from \`meta.version\` and \`meta.status\`
 "
   printf '%s' "$_out"
 }
 
+generate_check_workflow() {
+  cat <<'EOF'
+name: Check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            /nix/store
+            ~/.cache/nix
+          key: ${{ runner.os }}-nix-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nix-
+
+      - name: Check flake
+        run: nix flake check --show-trace
+
+      - name: Verify meta export
+        run: |
+          nix eval .#meta.name --raw
+          nix eval .#meta.version --raw
+          nix eval .#meta.status --raw
+EOF
+
+  if _has_provide "packages"; then
+    cat <<'EOF'
+
+      - name: Verify packages export
+        run: |
+          nix eval .#packages.x86_64-linux --apply builtins.attrNames
+EOF
+  fi
+
+  if _has_provide "nixosModules"; then
+    cat <<'EOF'
+
+      - name: Verify nixosModules export
+        run: |
+          nix eval .#nixosModules.default --apply 'x: "ok"'
+EOF
+  fi
+
+  if _has_provide "homeModules"; then
+    cat <<'EOF'
+
+      - name: Verify homeModules export
+        run: |
+          nix eval .#homeModules.default --apply 'x: "ok"'
+EOF
+  fi
+
+  if _has_provide "lib"; then
+    cat <<'EOF'
+
+      - name: Verify lib export
+        run: |
+          nix eval .#lib --apply builtins.attrNames
+EOF
+  fi
+
+  cat <<'EOF'
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Check Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+EOF
+}
+
+generate_update_flake_workflow() {
+  cat <<'EOF'
+name: Update Flake
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+jobs:
+  update-flake:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            /nix/store
+            ~/.cache/nix
+          key: ${{ runner.os }}-nix-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nix-
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update flake inputs
+        run: nix flake update
+
+      - name: Check flake still evaluates
+        run: nix flake check --show-trace
+
+      - name: Verify meta export
+        run: |
+          nix eval .#meta.name --raw
+          nix eval .#meta.version --raw
+          nix eval .#meta.status --raw
+EOF
+
+  if _has_provide "packages"; then
+    cat <<'EOF'
+
+      - name: Verify packages export
+        run: |
+          nix eval .#packages.x86_64-linux --apply builtins.attrNames
+EOF
+  fi
+
+  if _has_provide "nixosModules"; then
+    cat <<'EOF'
+
+      - name: Verify nixosModules export
+        run: |
+          nix eval .#nixosModules.default --apply 'x: "ok"'
+EOF
+  fi
+
+  if _has_provide "homeModules"; then
+    cat <<'EOF'
+
+      - name: Verify homeModules export
+        run: |
+          nix eval .#homeModules.default --apply 'x: "ok"'
+EOF
+  fi
+
+  if _has_provide "lib"; then
+    cat <<'EOF'
+
+      - name: Verify lib export
+        run: |
+          nix eval .#lib --apply builtins.attrNames
+EOF
+  fi
+
+  cat <<'EOF'
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: update-flake-lock
+          commit-message: "flake: update flake.lock"
+          title: "Update flake.lock"
+          body: |
+            Automated weekly `flake.lock` update.
+
+            - Updated flake inputs
+            - Re-ran `nix flake check`
+            - Re-validated exported flake outputs
+          labels: |
+            dependencies
+            automated
+          delete-branch: true
+EOF
+}
+
+generate_release_workflow() {
+  cat <<'EOF'
+name: Release
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read release metadata
+        id: meta
+        run: |
+          version="$(nix eval .#meta.version --raw)"
+          status="$(nix eval .#meta.status --raw)"
+          tag="v${version#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the version tag already exists
+        id: existing
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip duplicate release
+        if: steps.existing.outputs.exists == 'true'
+        run: |
+          echo "Version tag ${{ steps.meta.outputs.tag }} already exists. Skipping release."
+
+      - name: Create version and floating tags
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          version_tag="${{ steps.meta.outputs.tag }}"
+          status="${{ steps.meta.outputs.status }}"
+
+          git tag "$version_tag"
+
+          case "$status" in
+            stable|beta|unstable)
+              git tag -fa "$status" -m "Release $version_tag"
+              ;;
+            *)
+              echo "No floating tag for status '$status'"
+              ;;
+          esac
+
+          git push origin "refs/tags/$version_tag"
+
+          case "$status" in
+            stable|beta|unstable)
+              git push origin "refs/tags/$status" --force
+              ;;
+          esac
+
+      - name: Create GitHub Release
+        if: steps.existing.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+EOF
+}
+
 # ── Write files ───────────────────────────────────────────────────────────────
 write_file "$TARGET/flake.nix"          "$(generate_flake_nix)"
-write_file "$TARGET/ft-nixpkgs.json"    "$(generate_ft_nixpkgs_json)"
 write_file "$TARGET/README.md"          "$(generate_readme)"
 write_file "$TARGET/.gitignore"         ".direnv/
 result
 result-*
 .DS_Store"
+write_file "$TARGET/.github/workflows/check.yml"        "$(generate_check_workflow)"
+write_file "$TARGET/.github/workflows/update_flake.yml" "$(generate_update_flake_workflow)"
+write_file "$TARGET/.github/workflows/release.yml"      "$(generate_release_workflow)"
 
 if _has_provide "packages"; then
   write_file "$TARGET/packages/default.nix" \

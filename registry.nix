@@ -1,5 +1,5 @@
 # Registry — reads from the generated registry.json (single source of truth).
-# registry.json is produced by: python scripts/gen-registry.py
+# registry.json is produced by: bash scripts/gen-registry.sh
 # Never edit registry.json or registry.yaml by hand; edit the meta blocks in
 # flakes/*/default.nix and re-run the generator.
 { inputs, pkgsLib }:
@@ -14,13 +14,13 @@ let
   families = data.families;
 
   # Emit a trace warning when registry.json was written by an incompatible
-  # version of gen-registry.py.  Evaluates to null in both branches so it can
+  # version of gen-registry.sh.  Evaluates to null in both branches so it can
   # be forced with builtins.seq without changing the returned attrset.
   _schemaCheck =
     let ver = data.schemaVersion or 0; in
     if ver != 1
     then builtins.trace
-      "ft-nixpkgs: WARNING: registry.json has schemaVersion ${toString ver} (expected 1). Re-run: python scripts/gen-registry.py"
+      "ft-nixpkgs: WARNING: registry.json has schemaVersion ${toString ver} (expected 1). Re-run: bash scripts/gen-registry.sh"
       null
     else null;
 
