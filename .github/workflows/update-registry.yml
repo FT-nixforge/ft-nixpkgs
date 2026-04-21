@@ -25,6 +25,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure git credentials
+        run: |
+          git config --global url."https://github-actions[bot]:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Nix
         uses: cachix/install-nix-action@v27
         with:
