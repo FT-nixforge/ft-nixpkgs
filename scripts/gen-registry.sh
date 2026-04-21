@@ -102,6 +102,47 @@ is_excluded() {
   return 1
 }
 
+# Fetch all version tags from upstream repo via git ls-remote.
+# Returns JSON array sorted by semver (newest first); includes numeric tags and floating tags.
+# Returns empty array if repo is unreachable or has no tags.
+fetch_upstream_versions() {
+  local repo_url="$1"
+  
+  if ! command -v git &> /dev/null; then
+    printf '[]'
+    return 0
+  fi
+  
+  local refs
+  refs="$(git ls-remote --tags --heads "$repo_url" 2>/dev/null || true)"
+  
+  if [[ -z "$refs" ]]; then
+    printf '[]'
+    return 0
+  fi
+  
+  # Extract tag/branch names, filter for version tags
+  local versions=()
+  while IFS=$'\t' read -r _sha ref_name; do
+    local tag_name="${ref_name#refs/tags/}"
+    tag_name="${tag_name#refs/heads/}"
+    tag_name="${tag_name%^{}}"
+    
+    case "$tag_name" in
+      v[0-9]*|stable|beta|unstable|main)
+        versions+=("$tag_name")
+        ;;
+    esac
+  done <<< "$refs"
+  
+  # Deduplicate and output as JSON array
+  if [[ ${#versions[@]} -eq 0 ]]; then
+    printf '[]'
+  else
+    printf '%s\n' "${versions[@]}" | sort -u | jq -R -s 'split("\n") | map(select(length > 0))'
+  fi
+}
+
 # Outputs lines of "family_or_empty|name|abs_nix_path", sorted.
 # Called via process substitution — runs in a subshell; nullglob is safe here.
 discover_entries() {
@@ -277,6 +318,38 @@ if jq -e '[.[] | select(.error)] | length > 0' <<< "$RESULTS_JSON" >/dev/null; t
   HAS_ERROR=true
 fi
 
+# ── Collect version tags from upstream repos ──────────────────────────────────
+
+echo ""
+echo "Collecting upstream version tags..."
+
+# Build temporary versions file: name\tversions_json
+VERSIONS_FILE="$WORK_DIR/versions.txt"
+{
+  jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.repo // "")' <<< "$RESULTS_JSON" | \
+  while IFS=$'\t' read -r flake_name repo_url; do
+    if [[ -n "$repo_url" ]]; then
+      versions="$(fetch_upstream_versions "$repo_url")"
+      vlog "[$flake_name] found $(echo "$versions" | jq 'length') version tags"
+    else
+      versions="[]"
+    fi
+    printf '%s\t%s\n' "$flake_name" "$versions"
+  done
+} > "$VERSIONS_FILE"
+
+# Now merge versions into RESULTS_JSON by re-assembling it
+RESULTS_JSON_WITH_VERSIONS="[]"
+jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read -r entry_b64; do
+  entry="$(echo "$entry_b64" | base64 -d)"
+  flake_name="$(echo "$entry" | jq -r '.name')"
+  versions="$(grep "^${flake_name}	" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
+  echo "$entry" | jq --argjson versions "$versions" '.versions = $versions' >> "$WORK_DIR/results_with_versions.tmp"
+done
+# Also add failed entries (with error field)
+jq '.[] | select(.error != null)' <<< "$RESULTS_JSON" >> "$WORK_DIR/results_with_versions.tmp"
+RESULTS_JSON="$(jq -s '.' "$WORK_DIR/results_with_versions.tmp")"
+
 # ── Save updated cache (atomic) ───────────────────────────────────────────────
 
 NEW_CACHE="$(jq '
@@ -299,7 +372,7 @@ REGISTRY="$(jq -n \
   --argjson results  "$RESULTS_JSON" \
   '
   ($results | map(select(.error == null))) as $ok |
-  ($ok | map({key: .name, value: (.meta + {family: .family})}) | from_entries) as $flakes |
+  ($ok | map({key: .name, value: (.meta + {family: .family, versions: (.versions // [])})}) | from_entries) as $flakes |
   ($ok
     | map(select(.family != null))
     | group_by(.family)
