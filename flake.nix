@@ -35,23 +35,65 @@
 
       forAllSystems = pkgsLib.genAttrs lib.defaultSystems;
       pkgsFor       = system: import inputs.nixpkgs { inherit system; };
+
+      # Build the create-flake tool package for a given system.
+      # Exposed as packages.${system}.create-flake so it can be installed
+      # globally via environment.systemPackages or home.packages.
+      mkCreateFlake = system:
+        let pkgs = pkgsFor system; in
+        pkgs.writeShellApplication {
+          name          = "create-flake";
+          runtimeInputs = [ pkgs.git pkgs.jq pkgs.gum ];
+          text          = builtins.readFile ./scripts/create-flake.sh;
+        };
     in
-    lib.mkAggregatedOutputs { inherit flakeConfigs; } // {
+    # recursiveUpdate deep-merges packages.${system} so the create-flake tool
+    # sits alongside the registry packages aggregated from flakes/.
+    pkgsLib.recursiveUpdate (lib.mkAggregatedOutputs { inherit flakeConfigs; }) {
       # ft-nixpkgs library surface: registry + all factory helpers
       lib = lib // {
         registry = import ./registry.nix { inherit inputs pkgsLib; };
       };
 
-      # ── Flake apps ──────────────────────────────────────────────────────
+      # ── Tool packages ────────────────────────────────────────────────────
       #
+      #   Install globally on NixOS:
+      #     environment.systemPackages = [
+      #       inputs.ft-nixpkgs.packages.x86_64-linux.create-flake
+      #     ];
+      #
+      #   Or with home-manager:
+      #     home.packages = [ inputs.ft-nixpkgs.packages.x86_64-linux.create-flake ];
+      #
+      packages = forAllSystems (system: {
+        create-flake = mkCreateFlake system;
+      });
+
+      # ── Flake apps ──────────────────────────────────────────────────────────
+      #
+      #   nix run .#create-flake
       #   nix run .#add-flake -- FT-nixforge/nixbar
       #   nix run .#gen-registry
       #
-      # Both apps default the repo root to $PWD so they work when run via
-      # `nix run` from within a ft-nixpkgs checkout.
       apps = forAllSystems (system:
         let pkgs = pkgsFor system; in
         {
+          # Scaffold a new Nix flake with gum-powered TUI.
+          # Sets FT_REPO_ROOT to $PWD so family/dep selectors are populated
+          # from this checkout when invoked via `nix run`.
+          create-flake = {
+            type    = "app";
+            program = "${pkgs.writeShellApplication {
+              name          = "create-flake-app";
+              runtimeInputs = [ pkgs.git pkgs.jq pkgs.gum ];
+              text          = ''
+                FT_REPO_ROOT="''${FT_REPO_ROOT:-$PWD}"
+                export FT_REPO_ROOT
+                exec ${mkCreateFlake system}/bin/create-flake "$@"
+              '';
+            }}/bin/create-flake-app";
+          };
+
           # Interactive script to add a public GitHub flake to ft-nixpkgs.
           add-flake = {
             type    = "app";
@@ -59,27 +101,11 @@
               name          = "add-flake";
               runtimeInputs = [ pkgs.curl pkgs.jq pkgs.python3 ];
               text          = ''
-                # When run as a flake app, default the repo root to $PWD.
-                # The script also honours the FT_REPO_ROOT env var directly.
                 FT_REPO_ROOT="''${FT_REPO_ROOT:-$PWD}"
                 export FT_REPO_ROOT
                 exec bash ${./scripts/add-flake.sh} "$@"
               '';
             }}/bin/add-flake";
-          };
-
-          # Scaffold a new Nix flake with TUI-guided metadata collection.
-          create-flake = {
-            type    = "app";
-            program = "${pkgs.writeShellApplication {
-              name          = "create-flake";
-              runtimeInputs = [ pkgs.git pkgs.jq ];
-              text          = ''
-                FT_REPO_ROOT="''${FT_REPO_ROOT:-$PWD}"
-                export FT_REPO_ROOT
-                exec bash ${./scripts/create-flake.sh} "$@"
-              '';
-            }}/bin/create-flake";
           };
 
           # Regenerates registry.json and registry.yaml from flakes/*/default.nix.
@@ -92,14 +118,13 @@
                 exec bash ${./scripts/gen-registry.sh} --repo-root "$PWD" "$@"
               '';
             }}/bin/gen-registry";
+          };
         });
 
-      # ── Dev shell ────────────────────────────────────────────────────────
+      # ── Dev shell ────────────────────────────────────────────────────────────
       #
       #   nix develop
       #
-      # Provides all tools needed to work on ft-nixpkgs scripts without
-      # installing anything globally.
       devShells = forAllSystems (system:
         let pkgs = pkgsFor system; in
         {
@@ -109,13 +134,13 @@
               pkgs.jq
               pkgs.curl
               pkgs.nix
+              pkgs.gum
             ];
             shellHook = ''
               echo "ft-nixpkgs dev shell — available commands:"
+              echo "  create-flake [name]                      # scaffold a new flake"
+              echo "  bash scripts/add-flake.sh <repo>         # add a flake to the registry"
               echo "  bash scripts/gen-registry.sh             # regenerate registry"
-              echo "  bash scripts/add-flake.sh <repo>         # add a new flake"
-              echo "  bash scripts/gen-registry.sh --help"
-              echo "  bash scripts/add-flake.sh --help"
             '';
           };
         });
