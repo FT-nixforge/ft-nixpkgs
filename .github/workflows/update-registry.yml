@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Nix
         uses: cachix/install-nix-action@v27
@@ -34,7 +36,12 @@ jobs:
       - name: Commit updated registry
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update registry [skip ci]"
-          file_pattern: "registry.json registry.yaml"
-          commit_user_name: "github-actions[bot]"
-          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update registry [skip ci]"
+          branch: update-registry
+          title: "chore: update registry"
+          body: "Automated registry update."
+          delete-branch: true
+          add-paths: |
+            registry.json
+            registry.yaml
