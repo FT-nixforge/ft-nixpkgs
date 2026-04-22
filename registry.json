@@ -2,30 +2,43 @@
   "schemaVersion": 1,
   "flakes": {
     "ft-nixlaunch": {
-      "dependencies": ["ft-nixpalette"],
+      "dependencies": [
+        "ft-nixpalette"
+      ],
       "description": "Modern, polished Rofi application launcher for NixOS and Wayland",
       "name": "ft-nixlaunch",
-      "provides": ["packages", "homeModules", "overlays"],
+      "provides": [
+        "packages",
+        "homeModules",
+        "overlays"
+      ],
       "repo": "github:FT-nixforge/ft-nixlaunch",
       "role": "standalone",
       "status": "stable",
       "type": "module",
-      "version": "1.0.0",
-      "family": null,
-      "versions": ["v0.1.0", "v1.0.0"]
+      "version": "",
+      "versions": [
+        "v0.1.0",
+        "v1.0.0"
+      ],
+      "family": null
     },
     "ft-nixpalette": {
       "dependencies": [],
       "description": "Base16 color theming engine",
       "name": "ft-nixpalette",
-      "provides": ["nixosModules", "homeModules", "lib"],
+      "provides": [
+        "nixosModules",
+        "homeModules",
+        "lib"
+      ],
       "repo": "github:FT-nixforge/ft-nixpalette",
       "role": "parent",
       "status": "stable",
       "type": "library",
       "version": "1.0.1",
-      "family": null,
-      "versions": ["stable", "v1.0.1", "v1.1.0"]
+      "versions": [],
+      "family": null
     }
   },
   "families": {}
