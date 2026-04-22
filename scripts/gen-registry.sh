@@ -18,6 +18,7 @@ CACHE_FILE=".registry-cache.json"
 VERBOSE=false
 WORKERS=8
 REPO_ROOT=""
+CHECK_UPDATES=false
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ Options:
   --repo-root PATH   Path to the ft-nixpkgs repo root
                      (default: parent of this script's directory)
   --workers N        Number of parallel nix eval workers (default: 8)
+  --check-updates    Check upstream repos for newer versions and update default.nix files
   --verbose, -v      Print debug info (nix eval commands, cache hits, byte counts)
   --help, -h         Show this help message and exit
 EOF
@@ -42,10 +44,11 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo-root)  REPO_ROOT="$2"; shift 2 ;;
-    --workers)    WORKERS="$2";   shift 2 ;;
-    --verbose|-v) VERBOSE=true;   shift   ;;
-    --help|-h)    usage; exit 0           ;;
+    --repo-root)     REPO_ROOT="$2"; shift 2 ;;
+    --workers)       WORKERS="$2";   shift 2 ;;
+    --verbose|-v)    VERBOSE=true;   shift   ;;
+    --check-updates) CHECK_UPDATES=true; shift ;;
+    --help|-h)       usage; exit 0           ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 1 ;;
   esac
 done
@@ -107,40 +110,102 @@ is_excluded() {
 # Returns empty array if repo is unreachable or has no tags.
 fetch_upstream_versions() {
   local repo_url="$1"
-  
+
   if ! command -v git &> /dev/null; then
     printf '[]'
     return 0
   fi
-  
+
   local refs
   refs="$(git ls-remote --tags --heads "$repo_url" 2>/dev/null || true)"
-  
+
   if [[ -z "$refs" ]]; then
     printf '[]'
     return 0
   fi
-  
+
   # Extract tag/branch names, filter for version tags
   local versions=()
   while IFS=$'\t' read -r _sha ref_name; do
     local tag_name="${ref_name#refs/tags/}"
     tag_name="${tag_name#refs/heads/}"
     tag_name="${tag_name%^{}}"
-    
+
     case "$tag_name" in
       v[0-9]*|stable|beta|unstable|main)
         versions+=("$tag_name")
         ;;
     esac
   done <<< "$refs"
-  
+
   # Deduplicate and output as JSON array
   if [[ ${#versions[@]} -eq 0 ]]; then
     printf '[]'
   else
     printf '%s\n' "${versions[@]}" | sort -u | jq -R -s 'split("\n") | map(select(length > 0))'
   fi
+}
+
+# Compare two semver strings (with optional v prefix).
+# Returns 0 if $1 >= $2, 1 otherwise.
+# Falls back to string comparison if either isn't semver-like.
+semver_ge() {
+  local a="${1#v}" b="${2#v}"
+  local a_major a_minor a_patch b_major b_minor b_patch
+  a_major="$(echo "$a" | cut -d. -f1)"
+  a_minor="$(echo "$a" | cut -d. -f2)"
+  a_patch="$(echo "$a" | cut -d. -f3)"
+  b_major="$(echo "$b" | cut -d. -f1)"
+  b_minor="$(echo "$b" | cut -d. -f2)"
+  b_patch="$(echo "$b" | cut -d. -f3)"
+
+  if [[ "$a_major" =~ ^[0-9]+$ && "$a_minor" =~ ^[0-9]+$ && "$a_patch" =~ ^[0-9]+$ && \
+        "$b_major" =~ ^[0-9]+$ && "$b_minor" =~ ^[0-9]+$ && "$b_patch" =~ ^[0-9]+$ ]]; then
+    if [[ "$a_major" -gt "$b_major" ]]; then return 0; fi
+    if [[ "$a_major" -lt "$b_major" ]]; then return 1; fi
+    if [[ "$a_minor" -gt "$b_minor" ]]; then return 0; fi
+    if [[ "$a_minor" -lt "$b_minor" ]]; then return 1; fi
+    if [[ "$a_patch" -gt "$b_patch" ]]; then return 0; fi
+    if [[ "$a_patch" -lt "$b_patch" ]]; then return 1; fi
+    return 0
+  else
+    [[ "$a" > "$b" || "$a" == "$b" ]]
+  fi
+}
+
+# Given a JSON array of version tags, return the newest semver tag.
+# Prefers numeric tags over floating tags (stable, main, etc.).
+# Returns empty string if no suitable tag found.
+newest_version() {
+  local versions_json="$1"
+  local best=""
+  local tag
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    case "$tag" in
+      stable|beta|unstable|main|master) continue ;;
+    esac
+    if [[ -z "$best" ]] || ! semver_ge "$best" "$tag"; then
+      best="$tag"
+    fi
+  done < <(jq -r '.[]' <<< "$versions_json" 2>/dev/null)
+  printf '%s' "$best"
+}
+
+# Update version in a default.nix file if a newer version is available.
+# Args: nix_path current_version new_version
+# Returns 0 if file was modified, 1 otherwise.
+bump_version_in_nix() {
+  local nix_path="$1" current="$2" newest="$3"
+  if [[ -z "$newest" || "$newest" == "$current" ]]; then
+    return 1
+  fi
+  if semver_ge "$current" "$newest"; then
+    return 1
+  fi
+  sed -i "s/version\s*=\s*\"$current\"/version = \"$newest\"/" "$nix_path"
+  printf '  [bumped] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest"
+  return 0
 }
 
 # Outputs lines of "family_or_empty|name|abs_nix_path", sorted.
@@ -337,6 +402,20 @@ VERSIONS_FILE="$WORK_DIR/versions.txt"
     printf '%s\t%s\n' "$flake_name" "$versions"
   done
 } > "$VERSIONS_FILE"
+
+# ── Check for upstream version updates ────────────────────────────────────────
+
+if [[ "$CHECK_UPDATES" == true ]]; then
+  echo ""
+  echo "Checking for upstream version updates..."
+  jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + .nix_path' <<< "$RESULTS_JSON" | \
+  while IFS=$'\t' read -r flake_name current_version nix_path; do
+    [[ -n "$current_version" ]] || continue
+    versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
+    newest="$(newest_version "$versions")"
+    bump_version_in_nix "$nix_path" "$current_version" "$newest" || true
+  done
+fi
 
 # Now merge versions into RESULTS_JSON by re-assembling it
 RESULTS_JSON_WITH_VERSIONS="[]"

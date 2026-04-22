@@ -1,12 +1,8 @@
 name: Update Registry
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "flakes/**"
-      - "scripts/gen-registry.sh"
-      - "scripts/eval-meta.nix"
+  schedule:
+    - cron: "0 6 * * 1" # every Monday at 06:00 UTC
   workflow_dispatch: {} # allow manual runs
 
 permissions:
@@ -37,8 +33,8 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Generate registry
-        run: bash scripts/gen-registry.sh
+      - name: Generate registry & bump versions
+        run: bash scripts/gen-registry.sh --check-updates
 
       - name: Create pull request
         uses: peter-evans/create-pull-request@v5
