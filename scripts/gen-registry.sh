@@ -105,11 +105,38 @@ is_excluded() {
   return 1
 }
 
+# Convert a flake reference like "github:owner/repo" to a git HTTPS URL.
+flake_ref_to_git_url() {
+  local ref="$1"
+  case "$ref" in
+    github:*)
+      local path="${ref#github:}"
+      printf 'https://github.com/%s.git' "$path"
+      ;;
+    gitlab:*)
+      local path="${ref#gitlab:}"
+      printf 'https://gitlab.com/%s.git' "$path"
+      ;;
+    sourcehut:*)
+      local path="${ref#sourcehut:}"
+      printf 'https://git.sr.ht/%s' "$path"
+      ;;
+    http:*|https:*|git@*)
+      printf '%s' "$ref"
+      ;;
+    *)
+      # Unknown format, return as-is and let git ls-remote fail gracefully
+      printf '%s' "$ref"
+      ;;
+  esac
+}
+
 # Fetch all version tags from upstream repo via git ls-remote.
 # Returns JSON array sorted by semver (newest first); includes numeric tags and floating tags.
 # Returns empty array if repo is unreachable or has no tags.
 fetch_upstream_versions() {
   local repo_url="$1"
+  repo_url="$(flake_ref_to_git_url "$repo_url")"
 
   if ! command -v git &> /dev/null; then
     printf '[]'
@@ -192,11 +219,57 @@ newest_version() {
   printf '%s' "$best"
 }
 
+# Sort a single version tag for ordering.
+# Output: "sort_key\ttag" where sort_key controls final order.
+_version_sort_key() {
+  local tag="$1"
+  case "$tag" in
+    stable)   printf 'A\t%s' "$tag" ;;
+    beta)     printf 'B\t%s' "$tag" ;;
+    unstable) printf 'C\t%s' "$tag" ;;
+    wip)      printf 'Z\t%s' "$tag" ;;
+    deprecated) printf 'X\t%s' "$tag" ;; # dropped later
+    *)
+      # semver: negate the numeric parts so newer = earlier in sort
+      local v="${tag#v}"
+      local major minor patch
+      major="$(echo "$v" | cut -d. -f1)"
+      minor="$(echo "$v" | cut -d. -f2)"
+      patch="$(echo "$v" | cut -d. -f3)"
+      [[ "$major" =~ ^[0-9]+$ ]] || major=0
+      [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+      [[ "$patch" =~ ^[0-9]+$ ]] || patch=0
+      # Use 9999 - value so descending order becomes ascending
+      printf 'D%04d%04d%04d\t%s' "$((9999 - major))" "$((9999 - minor))" "$((9999 - patch))" "$tag"
+      ;;
+  esac
+}
+
+# Sort versions in the desired order:
+#   stable → beta → unstable → semver desc (newest first) → wip
+#   deprecated tags are dropped entirely.
+sort_versions() {
+  local json="$1"
+  local sorted
+  sorted="$(while IFS= read -r tag; do
+    [[ -n "$tag" && "$tag" != "deprecated" ]] || continue
+    _version_sort_key "$tag"
+  done < <(jq -r '.[]' <<< "$json" 2>/dev/null) | sort | cut -f2-)"
+  # Convert back to JSON array
+  if [[ -z "$sorted" ]]; then
+    echo '[]'
+  else
+    printf '%s\n' "$sorted" | jq -R . | jq -s .
+  fi
+}
+
 # Merge two JSON arrays of versions, deduplicate, sort.
 # Args: old_json_array new_json_array
 merge_version_arrays() {
   local old_json="$1" new_json="$2"
-  jq -s 'add | unique | sort' <<< "$old_json$new_json" 2>/dev/null || echo '[]'
+  local merged
+  merged="$(jq -s 'add | unique' <<< "$old_json$new_json" 2>/dev/null || echo '[]')"
+  sort_versions "$merged"
 }
 
 # Format a Nix list from a JSON array of strings.
@@ -239,8 +312,8 @@ bump_version_in_nix() {
     modified=true
   fi
 
-  # Bump main version if newer
-  if [[ -n "$newest" && "$newest" != "$current" ]] && ! semver_ge "$current" "$newest"; then
+  # Always set main version to the newest available semver
+  if [[ -n "$newest" && "$newest" != "$current" ]]; then
     sed -i "s/version\s*=\s*\"$current\"/version = \"$newest\"/" "$nix_path"
     printf '  [bumped version] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest"
     modified=true
@@ -471,18 +544,21 @@ RESULTS_JSON_WITH_VERSIONS="[]"
 jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read -r entry_b64; do
   entry="$(echo "$entry_b64" | base64 -d)"
   flake_name="$(echo "$entry" | jq -r '.name')"
-  versions="$(grep "^${flake_name}	" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
+  upstream_versions="$(grep "^${flake_name}	" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
   # If this flake was bumped, also update version and versions in the JSON result
   if [[ "$BUMPED_NAMES" == *" $flake_name "* ]]; then
-    newest="$(newest_version "$versions")"
-    merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$versions")"
+    newest="$(newest_version "$upstream_versions")"
+    merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$upstream_versions")"
     entry="$(echo "$entry" | jq --arg newest "$newest" --argjson merged "$merged_versions" '
       .meta.version = $newest |
       .meta.versions = $merged |
       .versions = $merged
     ')"
   else
-    entry="$(echo "$entry" | jq --argjson versions "$versions" '.versions = $versions')"
+    # Use meta.versions if available, otherwise fall back to upstream versions
+    entry="$(echo "$entry" | jq --argjson upstream "$upstream_versions" '
+      .versions = (.meta.versions // $upstream)
+    ')"
   fi
   echo "$entry" >> "$WORK_DIR/results_with_versions.tmp"
 done

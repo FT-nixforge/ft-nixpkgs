@@ -1,7 +1,7 @@
 { inputs, system, pkgsLib, ... }:
 
 let
-  flake = inputs.ft-nixpalette;
+  flake = inputs.ft-nixpalette or {};
 in
 {
   meta = {

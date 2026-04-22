@@ -14,7 +14,7 @@
 
 let
   # Replace FLAKE_NAME with the input attribute name defined in flake.nix
-  flake = inputs.FLAKE_NAME;
+  flake = inputs.FLAKE_NAME or {};
 in
 {
   meta = {

@@ -1,7 +1,7 @@
 { inputs, system, pkgsLib, ... }:
 
 let
-  flake = inputs.ft-nixlaunch;
+  flake = inputs.ft-nixlaunch or {};
 in
 {
   meta = {
