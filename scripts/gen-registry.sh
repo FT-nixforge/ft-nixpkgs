@@ -224,11 +224,11 @@ newest_version() {
 _version_sort_key() {
   local tag="$1"
   case "$tag" in
-    stable)   printf 'A\t%s' "$tag" ;;
-    beta)     printf 'B\t%s' "$tag" ;;
-    unstable) printf 'C\t%s' "$tag" ;;
-    wip)      printf 'Z\t%s' "$tag" ;;
-    deprecated) printf 'X\t%s' "$tag" ;; # dropped later
+    stable)   printf 'A\t%s\n' "$tag" ;;
+    beta)     printf 'B\t%s\n' "$tag" ;;
+    unstable) printf 'C\t%s\n' "$tag" ;;
+    wip)      printf 'Z\t%s\n' "$tag" ;;
+    deprecated) printf 'X\t%s\n' "$tag" ;; # dropped later
     *)
       # semver: negate the numeric parts so newer = earlier in sort
       local v="${tag#v}"
@@ -240,7 +240,7 @@ _version_sort_key() {
       [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
       [[ "$patch" =~ ^[0-9]+$ ]] || patch=0
       # Use 9999 - value so descending order becomes ascending
-      printf 'D%04d%04d%04d\t%s' "$((9999 - major))" "$((9999 - minor))" "$((9999 - patch))" "$tag"
+      printf 'D%04d%04d%04d\t%s\n' "$((9999 - major))" "$((9999 - minor))" "$((9999 - patch))" "$tag"
       ;;
   esac
 }
@@ -273,7 +273,17 @@ sort_versions() {
 merge_version_arrays() {
   local old_json="$1" new_json="$2"
   local merged
+  # Validate both inputs
+  if ! jq -e 'type == "array"' <<< "$old_json" >/dev/null 2>&1; then
+    old_json='[]'
+  fi
+  if ! jq -e 'type == "array"' <<< "$new_json" >/dev/null 2>&1; then
+    new_json='[]'
+  fi
   merged="$(jq -s 'add | unique' <<< "$old_json$new_json" 2>/dev/null || echo '[]')"
+  if ! jq -e 'type == "array"' <<< "$merged" >/dev/null 2>&1; then
+    merged='[]'
+  fi
   sort_versions "$merged"
 }
 
@@ -534,7 +544,8 @@ if [[ "$CHECK_UPDATES" == true ]]; then
   echo "Checking for upstream version updates..."
   while IFS=$'\t' read -r flake_name current_version current_versions_json nix_path; do
     [[ -n "$current_version" ]] || continue
-    upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
+    upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2)"
+    [[ -n "$upstream_versions" ]] || upstream_versions='[]'
     newest="$(newest_version "$upstream_versions")"
     if bump_version_in_nix "$nix_path" "$current_version" "$current_versions_json" "$upstream_versions" "$newest"; then
       BUMPED_NAMES="$BUMPED_NAMES $flake_name"
@@ -547,7 +558,8 @@ RESULTS_JSON_WITH_VERSIONS="[]"
 jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read -r entry_b64; do
   entry="$(echo "$entry_b64" | base64 -d)"
   flake_name="$(echo "$entry" | jq -r '.name')"
-  upstream_versions="$(grep "^${flake_name}	" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
+  upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2)"
+  [[ -n "$upstream_versions" ]] || upstream_versions='[]'
   # If this flake was bumped, also update version and versions in the JSON result
   if [[ "$BUMPED_NAMES" == *" $flake_name "* ]]; then
     newest="$(newest_version "$upstream_versions")"
