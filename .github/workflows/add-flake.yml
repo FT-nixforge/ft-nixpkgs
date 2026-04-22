@@ -105,9 +105,18 @@ jobs:
           set -euo pipefail
 
           echo "Fetching: nix eval ${FLAKE_URL}#meta --json"
-          if ! META_JSON="$(nix eval "${FLAKE_URL}#meta" --json 2>&1)"; then
+          _nix_stderr="$(mktemp)"
+          if ! META_JSON="$(nix eval "${FLAKE_URL}#meta" --json 2>"$_nix_stderr")"; then
             echo "::error::nix eval failed. Make sure the flake exports outputs.meta = { ... };"
-            echo "$META_JSON"
+            cat "$_nix_stderr"
+            rm -f "$_nix_stderr"
+            exit 1
+          fi
+          rm -f "$_nix_stderr"
+
+          # Sanity check: ensure we got valid JSON (not Nix warnings mixed in)
+          if ! echo "$META_JSON" | jq -e . >/dev/null 2>&1; then
+            echo "::error::nix eval output is not valid JSON. Got: $(echo "$META_JSON" | head -c 200)"
             exit 1
           fi
           echo "✓ outputs.meta fetched"
