@@ -14,7 +14,7 @@ in
     dependencies = [];
     status       = "stable";     # unstable | beta | stable | experimental | wip | deprecated
     version      = "1.1.0";
-    versions     = [ "stable" "v1.0.1" "v1.1.0" ];
+    versions     = [ "stable" "v1.1.0" "v1.0.1" ];
   };
 
   packages    = {};

@@ -14,7 +14,7 @@ in
     dependencies = [ "ft-nixpalette" ];
     status       = "stable";  # unstable | beta | stable | experimental | wip | deprecated
     version      = "1.0.0";
-    versions     = [ "v0.1.0" "v1.0.0" ];
+    versions     = [ "v1.0.0" "v0.1.0" ];
   };
 
   packages    = flake.packages.${system} or {};

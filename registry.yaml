@@ -18,8 +18,8 @@ flakes:
     type: module
     version: ''
     versions:
-    - v0.1.0
     - v1.0.0
+    - v0.1.0
     family: null
   ft-nixpalette:
     dependencies: []
@@ -33,7 +33,10 @@ flakes:
     role: parent
     status: stable
     type: library
-    version: 1.0.1
-    versions: []
+    version: 1.1.0
+    versions:
+    - stable
+    - v1.0.1
+    - v1.1.0
     family: null
 families: {}
