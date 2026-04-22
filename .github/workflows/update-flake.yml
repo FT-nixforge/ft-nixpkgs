@@ -54,7 +54,19 @@ jobs:
       - name: Update flake inputs
         run: nix flake update
 
+      - name: Check if flake.lock changed
+        id: check-lock
+        run: |
+          if git diff --quiet flake.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes to flake.lock"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "flake.lock changed"
+          fi
+
       - name: Check flake still evaluates
+        if: steps.check-lock.outputs.changed == 'true'
         run: nix flake check --show-trace
 
       - name: Verify lib and modules still export correctly
