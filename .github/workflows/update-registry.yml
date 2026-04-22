@@ -49,3 +49,8 @@ jobs:
           gh pr merge --squash --auto --delete-branch "${{ steps.create-pr.outputs.pull-request-number }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-flake:
+    needs: update-registry
+    uses: ./.github/workflows/update-flake.yml
+    secrets: inherit

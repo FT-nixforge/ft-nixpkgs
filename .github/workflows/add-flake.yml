@@ -189,6 +189,7 @@ jobs:
       # ── Step 6: open pull request ─────────────────────────────────────────────
       - name: Create pull request
         if: ${{ !inputs.dry_run }}
+        id: create-pr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ github.token }}
@@ -217,3 +218,9 @@ jobs:
             - [ ] `flake.nix` input entry is correct
             - [ ] Run `nix flake update ${{ steps.meta.outputs.name }}` locally before merging
             - [ ] `nix flake show` passes without errors
+
+  update-flake:
+    needs: add-flake
+    if: ${{ !inputs.dry_run }}
+    uses: ./.github/workflows/update-flake.yml
+    secrets: inherit

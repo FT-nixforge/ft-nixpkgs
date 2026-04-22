@@ -1,0 +1,123 @@
+name: Update Flake
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # every day at 00:00 UTC
+  workflow_dispatch: {}
+  workflow_call: {} # allow other workflows to trigger this
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  update-flake:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Remove GitHub auth headers
+        run: |
+          git config --global --unset-all http.https://github.com/.extraheader || true
+          git config --global --unset-all http.https://api.github.com/.extraheader || true
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --local --unset-all http.https://api.github.com/.extraheader || true
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/nix
+          key: ${{ runner.os }}-nix-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nix-
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update flake inputs
+        run: nix flake update
+
+      - name: Check flake still evaluates
+        run: nix flake check --show-trace
+
+      - name: Verify lib and modules still export correctly
+        run: |
+          nix eval .#lib --apply builtins.attrNames
+          nix eval .#nixosModules.default --apply 'x: "ok"' || true
+          nix eval .#homeModules.default --apply 'x: "ok"' || true
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: update-flake-lock
+          commit-message: "flake: update flake.lock"
+          title: "Update flake.lock"
+          body: |
+            Automated daily `flake.lock` update.
+
+            Flake check passed — lib, nixosModules, and homeModules all evaluate correctly.
+          labels: |
+            dependencies
+            automated
+            auto-merge
+          delete-branch: true
+
+      - name: Wait for checks and auto-merge
+        if: steps.create-pr.outputs.pull-request-number != ''
+        run: |
+          PR_NUMBER="${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "Waiting for required checks (Dependabot, CodeQL) on PR #$PR_NUMBER..."
+
+          # Poll until checks complete or timeout (10 minutes)
+          for i in {1..60}; do
+            sleep 10
+
+            # Get check statuses
+            checks=$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '
+              .statusCheckRollup[] |
+              select(.name | contains("Dependabot") or contains("CodeQL") or contains("codeql")) |
+              {name: .name, state: .state, status: .status}
+            ')
+
+            echo "Check status (attempt $i):"
+            echo "$checks"
+
+            # Check if all required checks passed
+            pending=$(echo "$checks" | grep -c "PENDING\|IN_PROGRESS" || true)
+            failed=$(echo "$checks" | grep -c "FAILURE\|ERROR" || true)
+
+            if [ "$failed" -gt 0 ]; then
+              echo "Required checks failed. Aborting merge."
+              exit 1
+            fi
+
+            if [ "$pending" -eq 0 ] && [ -n "$checks" ]; then
+              echo "All required checks passed. Merging..."
+              gh pr merge --squash --auto --delete-branch "$PR_NUMBER"
+              exit 0
+            fi
+          done
+
+          echo "Timeout waiting for checks. PR remains open for manual review."
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
