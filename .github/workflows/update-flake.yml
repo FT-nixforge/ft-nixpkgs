@@ -81,43 +81,40 @@ jobs:
             auto-merge
           delete-branch: true
 
-      - name: Wait for checks and auto-merge
+      - name: Enable auto-merge
         if: steps.create-pr.outputs.pull-request-number != ''
         run: |
           PR_NUMBER="${{ steps.create-pr.outputs.pull-request-number }}"
-          echo "Waiting for required checks (Dependabot, CodeQL) on PR #$PR_NUMBER..."
+          echo "Enabling auto-merge for PR #$PR_NUMBER..."
+          gh pr merge --squash --auto --delete-branch "$PR_NUMBER"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # Poll until checks complete or timeout (10 minutes)
-          for i in {1..60}; do
+      - name: Wait for checks to pass
+        if: steps.create-pr.outputs.pull-request-number != ''
+        run: |
+          PR_NUMBER="${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "Waiting for checks on PR #$PR_NUMBER..."
+
+          # Poll until PR is merged or timeout (15 minutes)
+          for i in {1..90}; do
             sleep 10
 
-            # Get check statuses
-            checks=$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '
-              .statusCheckRollup[] |
-              select(.name | contains("Dependabot") or contains("CodeQL") or contains("codeql")) |
-              {name: .name, state: .state, status: .status}
-            ')
+            state=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+            if [ "$state" = "MERGED" ]; then
+              echo "PR was merged successfully."
+              exit 0
+            fi
 
-            echo "Check status (attempt $i):"
-            echo "$checks"
-
-            # Check if all required checks passed
-            pending=$(echo "$checks" | grep -c "PENDING\|IN_PROGRESS" || true)
-            failed=$(echo "$checks" | grep -c "FAILURE\|ERROR" || true)
-
-            if [ "$failed" -gt 0 ]; then
-              echo "Required checks failed. Aborting merge."
+            if [ "$state" = "CLOSED" ]; then
+              echo "PR was closed without merging."
               exit 1
             fi
 
-            if [ "$pending" -eq 0 ] && [ -n "$checks" ]; then
-              echo "All required checks passed. Merging..."
-              gh pr merge --squash --auto --delete-branch "$PR_NUMBER"
-              exit 0
-            fi
+            echo "PR state: $state (attempt $i/90)"
           done
 
-          echo "Timeout waiting for checks. PR remains open for manual review."
+          echo "Timeout waiting for merge. PR may still be open."
           exit 1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
