@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash scripts/gen-registry.sh [--repo-root PATH] [--workers N] [--verbose]
-set -euo pipefail
+set -uo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 EXCLUDED=("_template")
@@ -315,8 +315,23 @@ bump_version_in_nix() {
     merged_nix_list="$(json_to_nix_list "$merged_versions")"
     # Replace any versions = ... line (single-line or multi-line) with single-line list
     if grep -q 'versions\s*=\s*\[' "$nix_path"; then
-      # Multi-line or single-line list: use perl for robust multi-line replacement
-      perl -i -0777 -pe 's/versions\s*=\s*\[.*?\];/versions     = '"$merged_nix_list"';/s' "$nix_path"
+      # Multi-line or single-line list
+      if command -v perl >/dev/null 2>&1; then
+        perl -i -0777 -pe 's/versions\s*=\s*\[.*?\];/versions     = '"$merged_nix_list"';/s' "$nix_path"
+      else
+        # Fallback: use awk for multi-line replacement
+        awk '
+          /versions\s*=\s*\[/ { in_versions = 1 }
+          in_versions && /\];/ {
+            print "    versions     = " merged ";"
+            in_versions = 0
+            next
+          }
+          in_versions { next }
+          { print }
+        ' merged="$merged_nix_list" "$nix_path" > "$nix_path.tmp"
+        mv "$nix_path.tmp" "$nix_path"
+      fi
     else
       # Missing entirely: insert after version line
       sed -i '/version\s*=\s*"[^"]*";/a\    versions     = '"$merged_nix_list"';' "$nix_path"
@@ -542,7 +557,6 @@ BUMPED_NAMES=""
 if [[ "$CHECK_UPDATES" == true ]]; then
   echo ""
   echo "Checking for upstream version updates..."
-  set +e
   while IFS=$'\t' read -r flake_name current_version current_versions_json nix_path; do
     [[ -n "$current_version" ]] || continue
     upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2)"
@@ -552,7 +566,6 @@ if [[ "$CHECK_UPDATES" == true ]]; then
       BUMPED_NAMES="$BUMPED_NAMES $flake_name"
     fi
   done < <(jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + (.meta.versions // "[]" | tojson) + "\t" + .nix_path' <<< "$RESULTS_JSON")
-  set -e
 fi
 
 # Now merge versions into RESULTS_JSON by re-assembling it
@@ -566,11 +579,14 @@ jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read 
   if [[ "$BUMPED_NAMES" == *" $flake_name "* ]]; then
     newest="$(newest_version "$upstream_versions")"
     merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$upstream_versions")"
-    entry="$(echo "$entry" | jq --arg newest "$newest" --argjson merged "$merged_versions" '
-      .meta.version = $newest |
-      .meta.versions = $merged |
-      .versions = $merged
-    ')"
+    # Validate merged_versions before passing to jq
+    if jq -e 'type == "array"' <<< "$merged_versions" >/dev/null 2>&1; then
+      entry="$(echo "$entry" | jq --arg newest "$newest" --argjson merged "$merged_versions" '
+        .meta.version = $newest |
+        .meta.versions = $merged |
+        .versions = $merged
+      ')"
+    fi
   else
     # Use meta.versions if available, otherwise fall back to upstream versions
     entry="$(echo "$entry" | jq --argjson upstream "$upstream_versions" '
