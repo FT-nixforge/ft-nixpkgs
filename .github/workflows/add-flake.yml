@@ -43,6 +43,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Nix
         uses: cachix/install-nix-action@v27
@@ -189,6 +191,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ github.token }}
           branch: add-flake/${{ steps.meta.outputs.name }}
           delete-branch: true
           commit-message: "feat: add ${{ steps.meta.outputs.name }} to registry"
