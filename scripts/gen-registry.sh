@@ -250,6 +250,11 @@ _version_sort_key() {
 #   deprecated tags are dropped entirely.
 sort_versions() {
   local json="$1"
+  # Validate input is a JSON array
+  if ! jq -e 'type == "array"' <<< "$json" >/dev/null 2>&1; then
+    echo '[]'
+    return
+  fi
   local sorted
   sorted="$(while IFS= read -r tag; do
     [[ -n "$tag" && "$tag" != "deprecated" ]] || continue
@@ -273,14 +278,15 @@ merge_version_arrays() {
 }
 
 # Format a Nix list from a JSON array of strings.
+# Output is a single-line Nix list suitable for sed replacement.
 json_to_nix_list() {
   local json="$1"
   local items
-  items="$(jq -r '.[]' <<< "$json" 2>/dev/null | sed 's/^/      "/; s/$/"/' | paste -sd '\n' -)"
+  items="$(jq -r '.[]' <<< "$json" 2>/dev/null | sed 's/^/"/; s/$/"/' | paste -sd ' ' -)"
   if [[ -z "$items" ]]; then
     printf '[]'
   else
-    printf '[\n%s\n    ]' "$items"
+    printf '[ %s ]' "$items"
   fi
 }
 
@@ -297,13 +303,10 @@ bump_version_in_nix() {
   # Update versions array if upstream added new tags
   if [[ "$merged_versions" != "$current_versions_json" ]]; then
     merged_nix_list="$(json_to_nix_list "$merged_versions")"
-    # Check if versions is on a single line (e.g. versions = [ "a" "b" ];)
-    if grep -q 'versions\s*=\s*\[.*\];' "$nix_path"; then
-      # Single-line list
-      sed -i 's/versions\s*=\s*\[.*\];/versions     = '"$merged_nix_list"';/' "$nix_path"
-    elif grep -q 'versions\s*=\s*\[' "$nix_path"; then
-      # Multi-line list: replace from "versions = [" to closing "]"
-      sed -i '/versions\s*=\s*\[/,/\];\?\s*$/c\    versions     = '"$merged_nix_list"';' "$nix_path"
+    # Replace any versions = ... line (single-line or multi-line) with single-line list
+    if grep -q 'versions\s*=\s*\[' "$nix_path"; then
+      # Multi-line or single-line list: use perl for robust multi-line replacement
+      perl -i -0777 -pe 's/versions\s*=\s*\[.*?\];/versions     = '"$merged_nix_list"';/s' "$nix_path"
     else
       # Missing entirely: insert after version line
       sed -i '/version\s*=\s*"[^"]*";/a\    versions     = '"$merged_nix_list"';' "$nix_path"
