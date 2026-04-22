@@ -542,6 +542,7 @@ BUMPED_NAMES=""
 if [[ "$CHECK_UPDATES" == true ]]; then
   echo ""
   echo "Checking for upstream version updates..."
+  set +e
   while IFS=$'\t' read -r flake_name current_version current_versions_json nix_path; do
     [[ -n "$current_version" ]] || continue
     upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2)"
@@ -551,6 +552,7 @@ if [[ "$CHECK_UPDATES" == true ]]; then
       BUMPED_NAMES="$BUMPED_NAMES $flake_name"
     fi
   done < <(jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + (.meta.versions // "[]" | tojson) + "\t" + .nix_path' <<< "$RESULTS_JSON")
+  set -e
 fi
 
 # Now merge versions into RESULTS_JSON by re-assembling it
