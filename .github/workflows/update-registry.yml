@@ -16,19 +16,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v27
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-
-      - name: Generate registry & bump versions
-        run: bash scripts/gen-registry.sh --check-updates
-
       - name: Generate app token
         id: token
         run: |
@@ -52,6 +39,20 @@ jobs:
             "https://api.github.com/app/installations/$install_id/access_tokens" | jq -r '.token')
 
           echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Generate registry & bump versions
+        run: bash scripts/gen-registry.sh --check-updates
 
       - name: Create pull request
         id: create-pr
