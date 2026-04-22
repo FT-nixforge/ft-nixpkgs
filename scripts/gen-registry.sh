@@ -192,20 +192,64 @@ newest_version() {
   printf '%s' "$best"
 }
 
-# Update version in a default.nix file if a newer version is available.
-# Args: nix_path current_version new_version
+# Merge two JSON arrays of versions, deduplicate, sort.
+# Args: old_json_array new_json_array
+merge_version_arrays() {
+  local old_json="$1" new_json="$2"
+  jq -s 'add | unique | sort' <<< "$old_json$new_json" 2>/dev/null || echo '[]'
+}
+
+# Format a Nix list from a JSON array of strings.
+json_to_nix_list() {
+  local json="$1"
+  local items
+  items="$(jq -r '.[]' <<< "$json" 2>/dev/null | sed 's/^/      "/; s/$/"/' | paste -sd '\n' -)"
+  if [[ -z "$items" ]]; then
+    printf '[]'
+  else
+    printf '[\n%s\n    ]' "$items"
+  fi
+}
+
+# Update version and versions in a default.nix file if newer versions are available.
+# Args: nix_path current_version current_versions_json upstream_versions_json newest_version
 # Returns 0 if file was modified, 1 otherwise.
 bump_version_in_nix() {
-  local nix_path="$1" current="$2" newest="$3"
-  if [[ -z "$newest" || "$newest" == "$current" ]]; then
-    return 1
+  local nix_path="$1" current="$2" current_versions_json="$3" upstream_versions_json="$4" newest="$5"
+  local merged_versions merged_nix_list modified=false
+
+  # Merge current and upstream versions
+  merged_versions="$(merge_version_arrays "$current_versions_json" "$upstream_versions_json")"
+
+  # Update versions array if upstream added new tags
+  if [[ "$merged_versions" != "$current_versions_json" ]]; then
+    merged_nix_list="$(json_to_nix_list "$merged_versions")"
+    # Check if versions is on a single line (e.g. versions = [ "a" "b" ];)
+    if grep -q 'versions\s*=\s*\[.*\];' "$nix_path"; then
+      # Single-line list
+      sed -i 's/versions\s*=\s*\[.*\];/versions     = '"$merged_nix_list"';/' "$nix_path"
+    elif grep -q 'versions\s*=\s*\[' "$nix_path"; then
+      # Multi-line list: replace from "versions = [" to closing "]"
+      sed -i '/versions\s*=\s*\[/,/\];\?\s*$/c\    versions     = '"$merged_nix_list"';' "$nix_path"
+    else
+      # Missing entirely: insert after version line
+      sed -i '/version\s*=\s*"[^"]*";/a\    versions     = '"$merged_nix_list"';' "$nix_path"
+    fi
+    printf '  [updated versions] %s\n' "$(basename "$(dirname "$nix_path")")"
+    modified=true
   fi
-  if semver_ge "$current" "$newest"; then
-    return 1
+
+  # Bump main version if newer
+  if [[ -n "$newest" && "$newest" != "$current" ]] && ! semver_ge "$current" "$newest"; then
+    sed -i "s/version\s*=\s*\"$current\"/version = \"$newest\"/" "$nix_path"
+    printf '  [bumped version] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest"
+    modified=true
   fi
-  sed -i "s/version\s*=\s*\"$current\"/version = \"$newest\"/" "$nix_path"
-  printf '  [bumped] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest"
-  return 0
+
+  if [[ "$modified" == true ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # Outputs lines of "family_or_empty|name|abs_nix_path", sorted.
@@ -405,16 +449,21 @@ VERSIONS_FILE="$WORK_DIR/versions.txt"
 
 # ── Check for upstream version updates ────────────────────────────────────────
 
+# ── Check for upstream version updates ────────────────────────────────────────
+
+BUMPED_NAMES=""
+
 if [[ "$CHECK_UPDATES" == true ]]; then
   echo ""
   echo "Checking for upstream version updates..."
-  jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + .nix_path' <<< "$RESULTS_JSON" | \
-  while IFS=$'\t' read -r flake_name current_version nix_path; do
+  while IFS=$'\t' read -r flake_name current_version current_versions_json nix_path; do
     [[ -n "$current_version" ]] || continue
-    versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
-    newest="$(newest_version "$versions")"
-    bump_version_in_nix "$nix_path" "$current_version" "$newest" || true
-  done
+    upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
+    newest="$(newest_version "$upstream_versions")"
+    if bump_version_in_nix "$nix_path" "$current_version" "$current_versions_json" "$upstream_versions" "$newest"; then
+      BUMPED_NAMES="$BUMPED_NAMES $flake_name"
+    fi
+  done < <(jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + (.meta.versions // "[]" | tojson) + "\t" + .nix_path' <<< "$RESULTS_JSON")
 fi
 
 # Now merge versions into RESULTS_JSON by re-assembling it
@@ -423,7 +472,19 @@ jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read 
   entry="$(echo "$entry_b64" | base64 -d)"
   flake_name="$(echo "$entry" | jq -r '.name')"
   versions="$(grep "^${flake_name}	" "$VERSIONS_FILE" | cut -f2 || echo '[]')"
-  echo "$entry" | jq --argjson versions "$versions" '.versions = $versions' >> "$WORK_DIR/results_with_versions.tmp"
+  # If this flake was bumped, also update version and versions in the JSON result
+  if [[ "$BUMPED_NAMES" == *" $flake_name "* ]]; then
+    newest="$(newest_version "$versions")"
+    merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$versions")"
+    entry="$(echo "$entry" | jq --arg newest "$newest" --argjson merged "$merged_versions" '
+      .meta.version = $newest |
+      .meta.versions = $merged |
+      .versions = $merged
+    ')"
+  else
+    entry="$(echo "$entry" | jq --argjson versions "$versions" '.versions = $versions')"
+  fi
+  echo "$entry" >> "$WORK_DIR/results_with_versions.tmp"
 done
 # Also add failed entries (with error field)
 jq '.[] | select(.error != null)' <<< "$RESULTS_JSON" >> "$WORK_DIR/results_with_versions.tmp"

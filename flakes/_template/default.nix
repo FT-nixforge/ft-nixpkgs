@@ -27,6 +27,7 @@ in
     dependencies = [];
     status       = "unstable"; # unstable | beta | stable | experimental | wip | deprecated
     version      = "0.1.0";
+    versions     = [];
   };
 
   packages    = flake.packages.${system} or {};
