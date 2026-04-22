@@ -6,8 +6,7 @@ on:
   workflow_dispatch: {} # allow manual runs
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -19,14 +18,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Configure git credentials
-        run: |
-          git config --global url."https://github-actions[bot]:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Nix
         uses: cachix/install-nix-action@v27
@@ -36,13 +27,28 @@ jobs:
       - name: Generate registry & bump versions
         run: bash scripts/gen-registry.sh --check-updates
 
-      - name: Create pull request
-        uses: peter-evans/create-pull-request@v5
+      - name: Generate app token
+        id: token
+        uses: tibdex/github-app-token@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          app_id: ${{ secrets.FT_NIXFORGE_APP_ID }}
+          private_key: ${{ secrets.FT_NIXFORGE_APP_PRIVATE_KEY }}
+
+      - name: Create pull request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ steps.token.outputs.token }}
           commit-message: "chore: update registry [skip ci]"
           branch: update-registry
           delete-branch: true
           title: "chore: update registry"
           body: "Automated registry update."
           base: main
+
+      - name: Auto-merge pull request
+        if: steps.create-pr.outputs.pull-request-number != ''
+        run: |
+          gh pr merge --squash --admin --delete-branch "${{ steps.create-pr.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
