@@ -71,3 +71,11 @@ jobs:
             - Updated flake inputs to latest versions
             - Verified with `nix flake check --no-build`
           base: main
+          labels: auto-merge
+
+      - name: Auto-merge pull request
+        if: github.event_name != 'pull_request' && steps.create-pr.outputs.pull-request-number != ''
+        run: |
+          gh pr merge --squash --auto --delete-branch "${{ steps.create-pr.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

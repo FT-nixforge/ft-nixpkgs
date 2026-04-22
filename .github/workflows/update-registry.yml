@@ -31,6 +31,7 @@ jobs:
         run: bash scripts/gen-registry.sh --check-updates
 
       - name: Create pull request
+        id: create-pr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -40,3 +41,11 @@ jobs:
           title: "chore: update registry"
           body: "Automated registry update."
           base: main
+          labels: auto-merge
+
+      - name: Auto-merge pull request
+        if: steps.create-pr.outputs.pull-request-number != ''
+        run: |
+          gh pr merge --squash --auto --delete-branch "${{ steps.create-pr.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
