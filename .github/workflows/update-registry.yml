@@ -6,7 +6,8 @@ on:
   workflow_dispatch: {} # allow manual runs
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -16,35 +17,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Generate app token
-        id: token
-        run: |
-          # Generate JWT
-          header='{"alg":"RS256","typ":"JWT"}'
-          now=$(date +%s)
-          payload="{\"iat\":$((now - 60)),\"exp\":$((now + 600)),\"iss\":${{ secrets.FT_NIXFORGE_APP_ID }}}"
-          b64enc() { openssl base64 -e -A | tr '+/' '-_' | tr -d '='; }
-          jwt="$(echo -n "$header" | b64enc).$(echo -n "$payload" | b64enc)"
-          sig="$(echo -n "$jwt" | openssl dgst -sha256 -sign <(echo '${{ secrets.FT_NIXFORGE_APP_PRIVATE_KEY }}') | b64enc)"
-          jwt="$jwt.$sig"
-
-          # Get installation ID for FT-nixforge org
-          install_id=$(curl -s -H "Authorization: Bearer $jwt" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/orgs/FT-nixforge/installation" | jq -r '.id')
-
-          # Get access token
-          token=$(curl -s -X POST -H "Authorization: Bearer $jwt" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/app/installations/$install_id/access_tokens" | jq -r '.token')
-
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          token: ${{ steps.token.outputs.token || secrets.GITHUB_TOKEN }}
-          persist-credentials: true
 
       - name: Install Nix
         uses: cachix/install-nix-action@v27
@@ -55,20 +29,12 @@ jobs:
         run: bash scripts/gen-registry.sh --check-updates
 
       - name: Create pull request
-        id: create-pr
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ steps.token.outputs.token }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore: update registry [skip ci]"
           branch: update-registry
           delete-branch: true
           title: "chore: update registry"
           body: "Automated registry update."
           base: main
-
-      - name: Auto-merge pull request
-        if: steps.create-pr.outputs.pull-request-number != ''
-        run: |
-          gh pr merge --squash --admin --delete-branch "${{ steps.create-pr.outputs.pull-request-number }}"
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
