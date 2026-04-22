@@ -3,6 +3,22 @@
 
 schemaVersion: 1
 flakes:
+  ft-nixlaunch:
+    dependencies:
+    - ft-nixpalette
+    description: Modern, polished Rofi application launcher for NixOS and Wayland
+    name: ft-nixlaunch
+    provides:
+    - packages
+    - homeModules
+    - overlays
+    repo: github:FT-nixforge/ft-nixlaunch
+    role: standalone
+    status: stable
+    type: module
+    version: 1.0.0
+    family: null
+    versions: []
   ft-nixpalette:
     dependencies: []
     description: Base16 color theming engine
