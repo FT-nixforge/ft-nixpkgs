@@ -1,8 +1,6 @@
 name: Update Flake
 
 on:
-  schedule:
-    - cron: "0 0 * * *" # every day at 00:00 UTC
   workflow_dispatch: {}
   workflow_call: {} # allow other workflows to trigger this
 
