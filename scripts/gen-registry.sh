@@ -421,7 +421,7 @@ eval_entry() {
   local nix_stdout="${out_file}.stdout"
   local nix_stderr="${out_file}.stderr"
   local nix_exit=0
-  local cmd=("nix-instantiate" "--eval" "--json" "$EVAL_NIX" "--arg" "flakePath" "$nix_path")
+  local cmd=("nix-instantiate" "--eval" "--strict" "--json" "$EVAL_NIX" "--arg" "flakePath" "$nix_path")
 
   vlog "${cmd[*]}"
   "${cmd[@]}" >"$nix_stdout" 2>"$nix_stderr" || nix_exit=$?
