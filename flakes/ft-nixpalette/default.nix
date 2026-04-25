@@ -1,4 +1,4 @@
-﻿{ inputs, system, pkgsLib, ... }:
+{ inputs, system, pkgsLib, ... }:
 
 let
   flake = inputs.ft-nixpalette or {};
