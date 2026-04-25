@@ -129,7 +129,7 @@ is_excluded() {
 # Version helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Convert a Nix flake reference to a plain HTTPS git URL for git ls-remote.
+# Convert a Nix flake reference to a plain HTTPS git URL.
 #
 #   github:owner/repo   →  https://github.com/owner/repo.git
 #   gitlab:owner/repo   →  https://gitlab.com/owner/repo.git
@@ -144,12 +144,34 @@ flake_ref_to_git_url() {
   esac
 }
 
-# Fetch every tag from a repo (flake ref or git URL) via git ls-remote.
-# Prints a JSON array of tag name strings (deduplicated, sorted).
-# Prints [] if git is unavailable, the repo is unreachable, or it has no tags.
+# Fetch every tag from a repo (flake ref or git URL).
+# For github: refs, uses the GitHub REST API (reliable in CI, supports GITHUB_TOKEN).
+# Falls back to git ls-remote for all other ref types.
+# Always prints a compact single-line JSON array of tag name strings.
+# Prints [] if the repo is unreachable or has no tags.
 fetch_upstream_tags() {
+  local ref="$1"
+
+  # ── GitHub: use the REST API (works in CI with or without a token) ───────────
+  if [[ "$ref" == github:* ]]; then
+    local owner_repo="${ref#github:}"
+    local api_url="https://api.github.com/repos/${owner_repo}/tags?per_page=100"
+
+    local curl_args=(-sfL -H "Accept: application/vnd.github+json")
+    # Use GITHUB_TOKEN when available (avoids anonymous rate-limiting in CI)
+    [[ -n "${GITHUB_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+
+    local response
+    response="$(curl "${curl_args[@]}" "$api_url" 2>/dev/null || true)"
+    [[ -z "$response" ]] && { printf '[]'; return; }
+
+    jq -c '[.[].name]' <<< "$response" 2>/dev/null || printf '[]'
+    return
+  fi
+
+  # ── All other forges: fall back to git ls-remote ─────────────────────────────
   local url
-  url="$(flake_ref_to_git_url "$1")"
+  url="$(flake_ref_to_git_url "$ref")"
   command -v git &>/dev/null || { printf '[]'; return; }
 
   local refs
@@ -158,14 +180,12 @@ fetch_upstream_tags() {
 
   local tags=()
   while IFS=$'\t' read -r _sha ref_name; do
-    # Strip refs/tags/ prefix and ^{} annotated-tag peel suffixes
     local tag="${ref_name#refs/tags/}"
     tag="${tag%^{}}"
     [[ -n "$tag" ]] && tags+=("$tag")
   done <<< "$refs"
 
   [[ ${#tags[@]} -eq 0 ]] && { printf '[]'; return; }
-  # -c (compact) keeps output on one line so it can be stored in a TSV column
   printf '%s\n' "${tags[@]}" | sort -u \
     | jq -cR -s 'split("\n") | map(select(length > 0))'
 }
@@ -543,11 +563,11 @@ VERSIONS_FILE="$WORK_DIR/versions.tsv"
           "$flake_name" \
           "$(jq 'length' <<< "$all_tags")" \
           "$(jq 'length' <<< "$semver_tags")" \
-          "$(jq -r '[.[]] | join(", ")' <<< "$semver_tags")"
+          "$(jq -r '[.[]] | join(", ")' <<< "$semver_tags")" >&2
       else
         all_tags='[]'
         semver_tags='[]'
-        printf '  [%s] no repo URL configured\n' "$flake_name"
+        printf '  [%s] no repo URL configured\n' "$flake_name" >&2
       fi
       printf '%s\t%s\t%s\n' "$flake_name" "$all_tags" "$semver_tags"
     done
