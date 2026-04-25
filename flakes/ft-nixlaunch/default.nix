@@ -6,22 +6,20 @@ in
 {
   meta = {
     name         = "ft-nixlaunch";
-    type         = "module";    # library | bundle | module | package | app
-    role         = "standalone";    # parent | child | standalone
+    type         = "module";
+    role         = "standalone";
     description  = "Modern, polished Rofi application launcher for NixOS and Wayland";
     repo         = "github:FT-nixforge/ft-nixlaunch";
     provides     = [ "packages" "homeModules" "overlays" ];
     dependencies = [ "ft-nixpalette" ];
-    status       = "stable";  # unstable | beta | stable | experimental | wip | deprecated
+    status       = "stable";
     version      = "1.0.0";
     versions     = [ "v1.0.0" "v0.1.0" ];
   };
 
-  packages    = flake.packages.${system} or {};
+  packages    = {};
   nixosModule = null;
-  homeModule  = flake.homeModules.default or flake.homeManagerModules.default or null;
+  homeModule  = flake.homeModules.default or null;
 
-  overlay = _final: prev: {
-    ft-nixlaunch = (flake.packages.${prev.system} or {}).default or null;
-  };
+  overlay = _final: prev: {};
 }

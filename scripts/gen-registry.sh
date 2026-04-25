@@ -132,9 +132,9 @@ flake_ref_to_git_url() {
 }
 
 # Fetch all version tags from upstream repo via git ls-remote.
-# Returns JSON array sorted by semver (newest first); includes numeric tags and floating tags.
+# Returns ALL tags as JSON array (deduplicated, sorted).
 # Returns empty array if repo is unreachable or has no tags.
-fetch_upstream_versions() {
+fetch_upstream_tags() {
   local repo_url="$1"
   repo_url="$(flake_ref_to_git_url "$repo_url")"
 
@@ -144,33 +144,49 @@ fetch_upstream_versions() {
   fi
 
   local refs
-  refs="$(git ls-remote --tags --heads "$repo_url" 2>/dev/null || true)"
+  refs="$(git ls-remote --tags "$repo_url" 2>/dev/null || true)"
 
   if [[ -z "$refs" ]]; then
     printf '[]'
     return 0
   fi
 
-  # Extract tag/branch names, filter for version tags
-  local versions=()
+  # Extract all tag names (excluding ^{} peel entries)
+  local tags=()
   while IFS=$'\t' read -r _sha ref_name; do
     local tag_name="${ref_name#refs/tags/}"
-    tag_name="${tag_name#refs/heads/}"
     tag_name="${tag_name%^{}}"
-
-    case "$tag_name" in
-      v[0-9]*|stable|beta|unstable|main)
-        versions+=("$tag_name")
-        ;;
-    esac
+    [[ -n "$tag_name" ]] && tags+=("$tag_name")
   done <<< "$refs"
 
   # Deduplicate and output as JSON array
-  if [[ ${#versions[@]} -eq 0 ]]; then
+  if [[ ${#tags[@]} -eq 0 ]]; then
     printf '[]'
   else
-    printf '%s\n' "${versions[@]}" | sort -u | jq -R -s 'split("\n") | map(select(length > 0))'
+    printf '%s\n' "${tags[@]}" | sort -u | jq -R -s 'split("\n") | map(select(length > 0))'
   fi
+}
+
+# Filter a JSON array of tags to only semver-like tags (vX.Y.Z or X.Y.Z).
+# Returns JSON array.
+filter_semver_tags() {
+  local json="$1"
+  jq '[.[] | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))]' <<< "$json" 2>/dev/null || echo '[]'
+}
+
+# Given a JSON array of semver tags, return the newest one.
+# Returns empty string if no suitable tag found.
+newest_version() {
+  local versions_json="$1"
+  local best=""
+  local tag
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    if [[ -z "$best" ]] || ! semver_ge "$best" "$tag"; then
+      best="$tag"
+    fi
+  done < <(jq -r '.[]' <<< "$versions_json" 2>/dev/null)
+  printf '%s' "$best"
 }
 
 # Compare two semver strings (with optional v prefix).
@@ -219,35 +235,9 @@ newest_version() {
   printf '%s' "$best"
 }
 
-# Sort a single version tag for ordering.
-# Output: "sort_key\ttag" where sort_key controls final order.
-_version_sort_key() {
-  local tag="$1"
-  case "$tag" in
-    stable)   printf 'A\t%s\n' "$tag" ;;
-    beta)     printf 'B\t%s\n' "$tag" ;;
-    unstable) printf 'C\t%s\n' "$tag" ;;
-    wip)      printf 'Z\t%s\n' "$tag" ;;
-    deprecated) printf 'X\t%s\n' "$tag" ;; # dropped later
-    *)
-      # semver: negate the numeric parts so newer = earlier in sort
-      local v="${tag#v}"
-      local major minor patch
-      major="$(echo "$v" | cut -d. -f1)"
-      minor="$(echo "$v" | cut -d. -f2)"
-      patch="$(echo "$v" | cut -d. -f3)"
-      [[ "$major" =~ ^[0-9]+$ ]] || major=0
-      [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
-      [[ "$patch" =~ ^[0-9]+$ ]] || patch=0
-      # Use 9999 - value so descending order becomes ascending
-      printf 'D%04d%04d%04d\t%s\n' "$((9999 - major))" "$((9999 - minor))" "$((9999 - patch))" "$tag"
-      ;;
-  esac
-}
-
-# Sort versions in the desired order:
-#   stable → beta → unstable → semver desc (newest first) → wip
-#   deprecated tags are dropped entirely.
+# Sort semver versions descending (newest first).
+# Input: JSON array of semver tags.
+# Output: JSON array sorted newest → oldest.
 sort_versions() {
   local json="$1"
   # Validate input is a JSON array
@@ -255,17 +245,22 @@ sort_versions() {
     echo '[]'
     return
   fi
-  local sorted
-  sorted="$(while IFS= read -r tag; do
-    [[ -n "$tag" && "$tag" != "deprecated" ]] || continue
-    _version_sort_key "$tag"
-  done < <(jq -r '.[]' <<< "$json" 2>/dev/null) | sort | cut -f2-)"
-  # Convert back to JSON array
-  if [[ -z "$sorted" ]]; then
-    echo '[]'
-  else
-    printf '%s\n' "$sorted" | jq -R . | jq -s .
-  fi
+  # Use jq to sort by semver: extract numeric parts, compare descending
+  jq '
+    map(
+      . as $tag |
+      (sub("^v"; "") | split(".") | map(tonumber)) as $parts |
+      {
+        tag: $tag,
+        major: ($parts[0] // 0),
+        minor: ($parts[1] // 0),
+        patch: ($parts[2] // 0)
+      }
+    ) |
+    sort_by(.major, .minor, .patch) |
+    reverse |
+    map(.tag)
+  ' <<< "$json" 2>/dev/null || echo '[]'
 }
 
 # Merge two JSON arrays of versions, deduplicate, sort.
@@ -533,18 +528,21 @@ fi
 echo ""
 echo "Collecting upstream version tags..."
 
-# Build temporary versions file: name\tversions_json
+# Build temporary versions file: name\tall_tags_json\tsemver_tags_json
 VERSIONS_FILE="$WORK_DIR/versions.txt"
 {
   jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.repo // "")' <<< "$RESULTS_JSON" | \
   while IFS=$'\t' read -r flake_name repo_url; do
     if [[ -n "$repo_url" ]]; then
-      versions="$(fetch_upstream_versions "$repo_url")"
-      vlog "[$flake_name] found $(echo "$versions" | jq 'length') version tags"
+      all_tags="$(fetch_upstream_tags "$repo_url")"
+      semver_tags="$(filter_semver_tags "$all_tags")"
+      vlog "[$flake_name] found $(echo "$all_tags" | jq 'length') tags, $(echo "$semver_tags" | jq 'length') semver"
     else
-      versions="[]"
+      all_tags="[]"
+      semver_tags="[]"
     fi
-    printf '%s\t%s\n' "$flake_name" "$versions"
+    # Store: flake_name\tall_tags\tsemver_tags
+    printf '%s\t%s\t%s\n' "$flake_name" "$all_tags" "$semver_tags"
   done
 } > "$VERSIONS_FILE"
 
@@ -559,10 +557,11 @@ if [[ "$CHECK_UPDATES" == true ]]; then
   echo "Checking for upstream version updates..."
   while IFS=$'\t' read -r flake_name current_version current_versions_json nix_path; do
     [[ -n "$current_version" ]] || continue
-    upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2)"
-    [[ -n "$upstream_versions" ]] || upstream_versions='[]'
-    newest="$(newest_version "$upstream_versions")"
-    if bump_version_in_nix "$nix_path" "$current_version" "$current_versions_json" "$upstream_versions" "$newest"; then
+    # VERSIONS_FILE: name\tall_tags\tsemver_tags
+    semver_tags="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f3)"
+    [[ -n "$semver_tags" ]] || semver_tags='[]'
+    newest="$(newest_version "$semver_tags")"
+    if bump_version_in_nix "$nix_path" "$current_version" "$current_versions_json" "$semver_tags" "$newest"; then
       BUMPED_NAMES="$BUMPED_NAMES $flake_name"
     fi
   done < <(jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + (.meta.versions // "[]" | tojson) + "\t" + .nix_path' <<< "$RESULTS_JSON")
@@ -573,12 +572,13 @@ RESULTS_JSON_WITH_VERSIONS="[]"
 jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read -r entry_b64; do
   entry="$(echo "$entry_b64" | base64 -d)"
   flake_name="$(echo "$entry" | jq -r '.name')"
-  upstream_versions="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f2)"
-  [[ -n "$upstream_versions" ]] || upstream_versions='[]'
+  # VERSIONS_FILE: name\tall_tags\tsemver_tags
+  semver_tags="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f3)"
+  [[ -n "$semver_tags" ]] || semver_tags='[]'
   # If this flake was bumped, also update version and versions in the JSON result
   if [[ "$BUMPED_NAMES" == *" $flake_name "* ]]; then
-    newest="$(newest_version "$upstream_versions")"
-    merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$upstream_versions")"
+    newest="$(newest_version "$semver_tags")"
+    merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$semver_tags")"
     # Validate merged_versions before passing to jq
     if jq -e 'type == "array"' <<< "$merged_versions" >/dev/null 2>&1; then
       entry="$(echo "$entry" | jq --arg newest "$newest" --argjson merged "$merged_versions" '
@@ -588,8 +588,8 @@ jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read 
       ')"
     fi
   else
-    # Use meta.versions if available, otherwise fall back to upstream versions
-    entry="$(echo "$entry" | jq --argjson upstream "$upstream_versions" '
+    # Use meta.versions if available, otherwise fall back to upstream semver tags
+    entry="$(echo "$entry" | jq --argjson upstream "$semver_tags" '
       .versions = (.meta.versions // $upstream)
     ')"
   fi
