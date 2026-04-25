@@ -146,11 +146,11 @@
         "stylix": "stylix"
       },
       "locked": {
-        "lastModified": 1777145989,
+        "lastModified": 1777148237,
         "narHash": "sha256-voy4vi0YWQgTNnnKKhb564SMLvb88nJcUFN56mBt8og=",
         "owner": "FT-nixforge",
         "repo": "ft-nixpalette",
-        "rev": "66cc512155834e868dfd8bcc68ee7c7716039800",
+        "rev": "7891749278da44cef7ae4f913e97b4bdfd475854",
         "type": "github"
       },
       "original": {
