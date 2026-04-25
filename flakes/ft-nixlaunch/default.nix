@@ -12,7 +12,8 @@ in
     repo         = "github:FT-nixforge/ft-nixlaunch";
     provides     = [ "packages" "homeModules" "overlays" ];
     dependencies = [ "ft-nixpalette" ];
-    version      = "1.0.0";
+    version      = "2.0.0";
+    versions     = [ "v2.0.0" "v1.0.0" "v0.1.0" ];
   };
 
   packages    = flake.packages.${system} or {};
