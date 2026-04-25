@@ -1,4 +1,4 @@
-{ inputs, system, pkgsLib, ... }:
+﻿{ inputs, system, pkgsLib, ... }:
 
 let
   flake = inputs.ft-nixpalette or {};
@@ -6,20 +6,23 @@ in
 {
   meta = {
     name         = "ft-nixpalette";
-    type         = "library";    # library | bundle | module | package | app
-    role         = "parent";     # parent | child | standalone
+    type         = "library";
+    role         = "parent";
     description  = "Base16 color theming engine";
     repo         = "github:FT-nixforge/ft-nixpalette";
-    provides     = [ "nixosModules" "homeModules" "lib" ];
+    provides     = [ "nixosModules" "lib" ];
     dependencies = [];
-    status       = "stable";     # unstable | beta | stable | experimental | wip | deprecated
-    version      = "1.1.0";
-    versions     = [ "stable" "v1.1.0" "v1.0.1" ];
+    status       = "stable";
+    version      = "1.5.0";
+    versions     = [ "stable" "v1.5.0" "v1.1.0" "v1.0.1" ];
   };
 
   packages    = {};
   nixosModule = flake.nixosModules.default or null;
-  homeModule  = flake.homeModules.default or flake.homeManagerModules.default or null;
+  # NOTE: ft-nixpalette is NixOS-only as of v1.5.0.
+  # Stylix runs system-wide and auto-propagates to HM via
+  # stylix.homeManagerIntegration. No separate HM module.
+  homeModule  = null;
   lib         = flake.lib or {};
 
   overlay = _final: _prev: {};
