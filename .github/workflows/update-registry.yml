@@ -65,8 +65,3 @@ jobs:
           exit 1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  update-flake:
-    needs: update-registry
-    uses: ./.github/workflows/update-flake.yml
-    secrets: inherit
