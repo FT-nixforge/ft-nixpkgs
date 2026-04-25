@@ -15,6 +15,8 @@
 let
   # Replace FLAKE_NAME with the input attribute name defined in flake.nix
   flake = inputs.FLAKE_NAME or {};
+  hasAttr = attrSet: attrName: builtins.hasAttr attrName attrSet;
+  safePackages = if hasAttr flake "packages" then flake.packages else {};
 in
 {
   meta = {
@@ -30,9 +32,9 @@ in
     versions     = [];
   };
 
-  packages    = flake.packages.${system} or {};
-  nixosModule = flake.nixosModules.default or null;
-  homeModule  = flake.homeModules.default or null;
+  packages    = if hasAttr safePackages system then safePackages.${system} else {};
+  nixosModule = if hasAttr flake "nixosModules" then flake.nixosModules.default or null else null;
+  homeModule  = if hasAttr flake "homeModules" then flake.homeModules.default or null else null;
 
   overlay = _final: _prev: {};
 }

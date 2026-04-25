@@ -335,10 +335,12 @@ bump_version_in_nix() {
     modified=true
   fi
 
-  # Always set main version to the newest available semver
-  if [[ -n "$newest" && "$newest" != "$current" ]]; then
-    sed -i "s/version\s*=\s*\"$current\"/version = \"$newest\"/" "$nix_path"
-    printf '  [bumped version] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest"
+  # Always set main version to the newest available semver (strip v prefix)
+  local newest_stripped="${newest#v}"
+  local current_stripped="${current#v}"
+  if [[ -n "$newest_stripped" && "$newest_stripped" != "$current_stripped" ]]; then
+    sed -i "s/version\s*=\s*\"$current\"/version = \"$newest_stripped\"/" "$nix_path"
+    printf '  [bumped version] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest_stripped"
     modified=true
   fi
 
@@ -419,7 +421,7 @@ eval_entry() {
   local nix_stdout="${out_file}.stdout"
   local nix_stderr="${out_file}.stderr"
   local nix_exit=0
-  local cmd=("nix-instantiate" "--eval" "--json" "--strict" "$EVAL_NIX" "--arg" "flakePath" "$nix_path")
+  local cmd=("nix-instantiate" "--eval" "--json" "$EVAL_NIX" "--arg" "flakePath" "$nix_path")
 
   vlog "${cmd[*]}"
   "${cmd[@]}" >"$nix_stdout" 2>"$nix_stderr" || nix_exit=$?
@@ -550,7 +552,7 @@ VERSIONS_FILE="$WORK_DIR/versions.txt"
 
 # ── Check for upstream version updates ────────────────────────────────────────
 
-BUMPED_NAMES=""
+BUMPED_NAMES=()
 
 if [[ "$CHECK_UPDATES" == true ]]; then
   echo ""
@@ -562,7 +564,7 @@ if [[ "$CHECK_UPDATES" == true ]]; then
     [[ -n "$semver_tags" ]] || semver_tags='[]'
     newest="$(newest_version "$semver_tags")"
     if bump_version_in_nix "$nix_path" "$current_version" "$current_versions_json" "$semver_tags" "$newest"; then
-      BUMPED_NAMES="$BUMPED_NAMES $flake_name"
+      BUMPED_NAMES+=("$flake_name")
     fi
   done < <(jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + (.meta.versions // "[]" | tojson) + "\t" + .nix_path' <<< "$RESULTS_JSON")
 fi
@@ -576,12 +578,20 @@ jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read 
   semver_tags="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f3)"
   [[ -n "$semver_tags" ]] || semver_tags='[]'
   # If this flake was bumped, also update version and versions in the JSON result
-  if [[ "$BUMPED_NAMES" == *" $flake_name "* ]]; then
+  local was_bumped=false
+  for bumped in "${BUMPED_NAMES[@]}"; do
+    if [[ "$bumped" == "$flake_name" ]]; then
+      was_bumped=true
+      break
+    fi
+  done
+  if [[ "$was_bumped" == true ]]; then
     newest="$(newest_version "$semver_tags")"
+    newest_stripped="${newest#v}"
     merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$semver_tags")"
     # Validate merged_versions before passing to jq
     if jq -e 'type == "array"' <<< "$merged_versions" >/dev/null 2>&1; then
-      entry="$(echo "$entry" | jq --arg newest "$newest" --argjson merged "$merged_versions" '
+      entry="$(echo "$entry" | jq --arg newest "$newest_stripped" --argjson merged "$merged_versions" '
         .meta.version = $newest |
         .meta.versions = $merged |
         .versions = $merged

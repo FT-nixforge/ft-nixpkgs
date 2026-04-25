@@ -2,7 +2,7 @@
 # flake config function without needing real inputs or a Nix system.
 #
 # Usage:
-#   nix-instantiate --eval --json --strict scripts/eval-meta.nix \
+#   nix-instantiate --eval --json scripts/eval-meta.nix \
 #       --arg flakePath /abs/path/to/flakes/family/name/default.nix
 #
 # Note: use nix-instantiate (not `nix eval`) — the classic `nix` CLI correctly

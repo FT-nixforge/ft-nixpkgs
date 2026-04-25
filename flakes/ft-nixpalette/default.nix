@@ -2,6 +2,7 @@
 
 let
   flake = inputs.ft-nixpalette or {};
+  hasAttr = attrSet: attrName: builtins.hasAttr attrName attrSet;
 in
 {
   meta = {
@@ -18,9 +19,9 @@ in
   };
 
   packages    = {};
-  nixosModule = flake.nixosModules.default or null;
+  nixosModule = if hasAttr flake "nixosModules" then flake.nixosModules.default or null else null;
   homeModule  = null;
-  lib         = flake.lib or {};
+  lib         = if hasAttr flake "lib" then flake.lib else {};
 
   overlay = _final: _prev: {};
 }
