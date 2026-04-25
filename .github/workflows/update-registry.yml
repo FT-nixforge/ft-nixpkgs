@@ -46,22 +46,7 @@ jobs:
       - name: Enable auto-merge
         if: steps.create-pr.outputs.pull-request-number != ''
         run: |
-          gh pr merge --squash --auto --delete-branch "${{ steps.create-pr.outputs.pull-request-number }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Wait for merge
-        if: steps.create-pr.outputs.pull-request-number != ''
-        run: |
-          PR_NUMBER="${{ steps.create-pr.outputs.pull-request-number }}"
-          for i in {1..90}; do
-            sleep 10
-            state=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
-            [ "$state" = "MERGED" ] && { echo "PR merged."; exit 0; }
-            [ "$state" = "CLOSED" ] && { echo "PR closed without merge."; exit 1; }
-            echo "PR state: $state (attempt $i/90)"
-          done
-          echo "Timeout."
-          exit 1
+          gh pr merge --squash --auto "${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "Auto-merge enabled on PR #${{ steps.create-pr.outputs.pull-request-number }}. GitHub will merge it once all checks pass."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
