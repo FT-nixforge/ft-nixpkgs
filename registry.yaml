@@ -15,11 +15,12 @@ flakes:
     repo: github:FT-nixforge/ft-nixlaunch
     role: standalone
     type: module
-    version: 1.0.0
-    family: null
+    version: 2.0.0
     versions:
+    - v2.0.0
     - v1.0.0
     - v0.1.0
+    family: null
   ft-nixpalette:
     dependencies: []
     description: Base16 color theming engine
@@ -31,7 +32,6 @@ flakes:
     role: standalone
     type: library
     version: 1.5.1
-    family: null
     versions:
     - v1.5.1
     - v1.5.0
@@ -40,4 +40,5 @@ flakes:
     - v1.2.0
     - v1.1.0
     - v1.0.1
+    family: null
 families: {}
