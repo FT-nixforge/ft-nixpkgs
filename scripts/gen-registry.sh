@@ -153,14 +153,8 @@ fetch_upstream_tags() {
   local ref="$1"
 
   # ── GitHub: use the REST API (works in CI with or without a token) ───────────
-  if [[ "$ref" == github:* ]] || [[ "$ref" == git+ssh://git@github.com/* ]]; then
-    local owner_repo
-    if [[ "$ref" == github:* ]]; then
-      owner_repo="${ref#github:}"
-    else
-      owner_repo="${ref#git+ssh://git@github.com/}"
-      owner_repo="${owner_repo%.git}"
-    fi
+  if [[ "$ref" == github:* ]]; then
+    local owner_repo="${ref#github:}"
     local api_url="https://api.github.com/repos/${owner_repo}/tags?per_page=100"
 
     local curl_args=(-sfL -H "Accept: application/vnd.github+json")

@@ -9,9 +9,9 @@
     };
 
     # ── FT-nixforge flakes ──────────────────────────────────────────────────
-    ft-nixpalette.url = "git+ssh://github:FT-nixforge/ft-nixpalette";
+    ft-nixpalette.url = "github:FT-nixforge/ft-nixpalette";
 
-    ft-nixlaunch.url = "git+ssh://github:FT-nixforge/ft-nixlaunch";
+    ft-nixlaunch.url = "github:FT-nixforge/ft-nixlaunch";
     # ── Planned (uncomment when the repo is published) ──────────────────────
     # nixui.url     = "github:FT-nixforge/nixui";
     # nixbar.url    = "github:FT-nixforge/nixbar";
