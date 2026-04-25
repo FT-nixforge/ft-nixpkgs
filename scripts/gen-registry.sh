@@ -217,10 +217,10 @@ newest_version() {
 
 # Sort a JSON array of semver tags newest-first.
 # Non-semver entries sort to the end (patch treated as 0).
-# Prints [] on invalid input.
+# Always prints compact single-line JSON. Prints [] on invalid input.
 sort_versions() {
   jq -e 'type == "array"' <<< "$1" >/dev/null 2>&1 || { printf '[]'; return; }
-  jq '
+  jq -c '
     map(
       . as $tag |
       (sub("^v"; "") | split(".") | map(tonumber? // 0)) as $p |
@@ -272,7 +272,8 @@ bump_version_in_nix() {
   merged_versions="$(merge_version_arrays "$current_versions_json" "$upstream_versions_json")"
 
   # ── Rewrite `versions = [ ... ];` when the merged list has grown ─────────────
-  if [[ "$merged_versions" != "$current_versions_json" ]]; then
+  # Compare semantically (not as strings) so JSON formatting never causes false positives.
+  if ! jq -e --argjson cur "$current_versions_json" '. == $cur' <<< "$merged_versions" >/dev/null 2>&1; then
     local nix_list
     nix_list="$(json_to_nix_list "$merged_versions")"
 
@@ -538,11 +539,15 @@ VERSIONS_FILE="$WORK_DIR/versions.tsv"
       if [[ -n "$repo_url" ]]; then
         all_tags="$(fetch_upstream_tags "$repo_url")"
         semver_tags="$(filter_semver_tags "$all_tags")"
-        vlog "[$flake_name] $(jq 'length' <<< "$all_tags") total tags," \
-             "$(jq 'length' <<< "$semver_tags") semver"
+        printf '  [%s] %s total tags, %s semver: %s\n' \
+          "$flake_name" \
+          "$(jq 'length' <<< "$all_tags")" \
+          "$(jq 'length' <<< "$semver_tags")" \
+          "$(jq -r '[.[]] | join(", ")' <<< "$semver_tags")"
       else
         all_tags='[]'
         semver_tags='[]'
+        printf '  [%s] no repo URL configured\n' "$flake_name"
       fi
       printf '%s\t%s\t%s\n' "$flake_name" "$all_tags" "$semver_tags"
     done
