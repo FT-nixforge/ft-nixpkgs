@@ -27,7 +27,6 @@ in
     repo         = "github:FT-nixforge/FLAKE_NAME";
     provides     = [ "packages" "homeModules" ];  # adjust as needed
     dependencies = [];
-    status       = "unstable"; # unstable | beta | stable | experimental | wip | deprecated
     version      = "0.1.0";
     versions     = [];
   };

@@ -141,40 +141,96 @@ HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${RAW_BASE}/flake.nix")
 [[ "$HTTP_STATUS" == "200" ]] || die "No flake.nix found in ${OWNER}/${REPO_NAME} (HTTP ${HTTP_STATUS})."
 ok "flake.nix found"
 
-# ── Fetch metadata via nix eval ───────────────────────────────────────────────
+# ── Fetch metadata (or infer it when the flake has no outputs.meta) ───────────
 info "Fetching metadata via nix eval ${FLAKE_URL}#meta..."
-META_JSON="$(nix eval "${FLAKE_URL}#meta" --json \
-  --extra-experimental-features 'nix-command flakes' 2>/dev/null)" \
-  || die "nix eval failed.\nMake sure the flake exports:  outputs.meta = { name = ...; type = ...; ... };"
+META_JSON=""
+_nix_err="$(mktemp)"
+if META_JSON_RAW="$(nix eval "${FLAKE_URL}#meta" --json \
+    --extra-experimental-features 'nix-command flakes' 2>"$_nix_err")" \
+    && echo "$META_JSON_RAW" | jq -e . &>/dev/null; then
+  META_JSON="$META_JSON_RAW"
+  ok "outputs.meta fetched from flake"
+else
+  warn "Flake does not export outputs.meta — inferring from available sources"
+fi
+rm -f "$_nix_err"
 
-[[ -n "$META_JSON" ]] || die "nix eval returned empty output."
-ok "metadata fetched"
-vecho "Raw JSON:"; $VERBOSE && echo "$META_JSON" | jq . >&2 || true
+# When the flake has no meta block, build one from the GitHub API + nix flake show
+if [[ -z "$META_JSON" ]]; then
+  info "Querying GitHub API for repo info..."
 
-if ! echo "$META_JSON" | jq -e . &>/dev/null; then
-  die "Fetched metadata is not valid JSON."
+  REPO_DESC=""
+  LATEST_VERSION="0.1.0"
+  PROVIDES='[]'
+
+  # Repo description
+  if REPO_INFO="$(curl -sfL \
+      -H "Accept: application/vnd.github+json" \
+      ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} \
+      "https://api.github.com/repos/${OWNER}/${REPO_NAME}" 2>/dev/null)"; then
+    REPO_DESC="$(jq -r '.description // ""' <<< "$REPO_INFO")"
+  fi
+
+  # Latest semver tag
+  if TAGS_JSON="$(curl -sfL \
+      -H "Accept: application/vnd.github+json" \
+      ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} \
+      "https://api.github.com/repos/${OWNER}/${REPO_NAME}/tags?per_page=50" 2>/dev/null)"; then
+    RAW_VER="$(jq -r \
+      '[.[].name | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first // ""' \
+      <<< "$TAGS_JSON")"
+    [[ -n "$RAW_VER" ]] && LATEST_VERSION="${RAW_VER#v}"
+  fi
+
+  # Infer provides from nix flake show
+  if SHOW_JSON="$(nix flake show "${FLAKE_URL}" --json \
+      --extra-experimental-features 'nix-command flakes' 2>/dev/null)"; then
+    PROVIDES="$(jq -c '[
+      if has("packages")     then "packages"     else empty end,
+      if has("nixosModules") then "nixosModules" else empty end,
+      if has("homeModules")  then "homeModules"  else empty end,
+      if has("overlays")     then "overlays"     else empty end,
+      if has("lib")          then "lib"          else empty end
+    ]' <<< "$SHOW_JSON" 2>/dev/null || echo '[]')"
+  fi
+
+  META_JSON="$(jq -n \
+    --arg name    "$REPO_NAME" \
+    --arg type    "module" \
+    --arg role    "standalone" \
+    --arg desc    "$REPO_DESC" \
+    --arg repo    "github:${OWNER}/${REPO_NAME}" \
+    --arg version "$LATEST_VERSION" \
+    --argjson provides "$PROVIDES" \
+    '{
+      name:         $name,
+      type:         $type,
+      role:         $role,
+      description:  $desc,
+      repo:         $repo,
+      provides:     $provides,
+      dependencies: [],
+      version:      $version,
+      versions:     []
+    }')"
+
+  ok "Metadata inferred — please review the generated default.nix"
 fi
 
 # ── Parse fields ──────────────────────────────────────────────────────────────
-jq_get() { echo "$META_JSON" | jq -r "$1 // empty"; }
+jq_get() { jq -r "$1 // empty" <<< "$META_JSON"; }
 
 FLAKE_NAME="$(jq_get '.name')"
 FLAKE_TYPE="$(jq_get '.type')"
 FLAKE_ROLE="$(jq_get '.role')"
 FLAKE_DESC="$(jq_get '.description')"
-FLAKE_STATUS="$(jq_get '.status')"
 FLAKE_VERSION="$(jq_get '.version')"
-PROVIDES_RAW="$(echo "$META_JSON" | jq -c '.provides // []')"
-DEPS_RAW="$(echo "$META_JSON" | jq -c '.dependencies // []')"
+PROVIDES_RAW="$(jq -c '.provides // []' <<< "$META_JSON")"
+DEPS_RAW="$(jq -c '.dependencies // []' <<< "$META_JSON")"
 
 # ── Validate ──────────────────────────────────────────────────────────────────
 errors=()
-[[ -z "$FLAKE_NAME" ]]    && errors+=("meta.name is missing")
-[[ -z "$FLAKE_TYPE" ]]    && errors+=("meta.type is missing")
-[[ -z "$FLAKE_ROLE" ]]    && errors+=("meta.role is missing")
-[[ -z "$FLAKE_DESC" ]]    && errors+=("meta.description is missing")
-[[ -z "$FLAKE_STATUS" ]]  && errors+=("meta.status is missing")
-[[ -z "$FLAKE_VERSION" ]] && errors+=("meta.version is missing")
+[[ -z "$FLAKE_NAME" ]] && errors+=("meta.name is missing")
 
 valid_types=("library" "bundle" "module" "package" "app")
 if [[ -n "$FLAKE_TYPE" ]] && ! printf '%s\n' "${valid_types[@]}" | grep -qx "$FLAKE_TYPE"; then
@@ -183,10 +239,6 @@ fi
 valid_roles=("parent" "child" "standalone")
 if [[ -n "$FLAKE_ROLE" ]] && ! printf '%s\n' "${valid_roles[@]}" | grep -qx "$FLAKE_ROLE"; then
   errors+=("meta.role '$FLAKE_ROLE' is not valid (${valid_roles[*]})")
-fi
-valid_statuses=("unstable" "beta" "stable" "experimental" "wip" "deprecated")
-if [[ -n "$FLAKE_STATUS" ]] && ! printf '%s\n' "${valid_statuses[@]}" | grep -qx "$FLAKE_STATUS"; then
-  errors+=("meta.status '$FLAKE_STATUS' is not valid (${valid_statuses[*]})")
 fi
 
 if [[ ${#errors[@]} -gt 0 ]]; then
@@ -207,7 +259,6 @@ echo "  type:         ${FLAKE_TYPE}"
 echo "  role:         ${FLAKE_ROLE}"
 echo "  family:       ${FLAKE_FAMILY:-(standalone)}"
 echo "  description:  ${FLAKE_DESC}"
-echo "  status:       ${FLAKE_STATUS}"
 echo "  version:      ${FLAKE_VERSION}"
 echo "  provides:     $(echo "$PROVIDES_RAW" | jq -r 'join(", ")')"
 echo "  dependencies: $(echo "$DEPS_RAW" | jq -r 'join(", ") | if . == "" then "(none)" else . end')"
@@ -251,7 +302,6 @@ NIX_TYPE="$(nix_escape "$FLAKE_TYPE")"
 NIX_ROLE="$(nix_escape "$FLAKE_ROLE")"
 NIX_DESC="$(nix_escape "$FLAKE_DESC")"
 NIX_REPO="$(nix_escape "$FLAKE_URL")"
-NIX_STATUS="$(nix_escape "$FLAKE_STATUS")"
 NIX_VERSION="$(nix_escape "$FLAKE_VERSION")"
 NIX_PROVIDES="$(echo "$PROVIDES_RAW" | jq -r '[ .[] | "\"" + . + "\"" ] | "[ " + join(" ") + " ]"')"
 NIX_DEPS="$(echo "$DEPS_RAW" | jq -r '[ .[] | "\"" + . + "\"" ] | "[ " + join(" ") + " ]"')"
@@ -271,7 +321,6 @@ printf '    description  = "%s";\n' "$NIX_DESC"
 printf '    repo         = "%s";\n' "$NIX_REPO"
 printf '    provides     = %s;\n'   "$NIX_PROVIDES"
 printf '    dependencies = %s;\n'   "$NIX_DEPS"
-printf '    status       = "%s";  # unstable | beta | stable | experimental | wip | deprecated\n' "$NIX_STATUS"
 printf '    version      = "%s";\n' "$NIX_VERSION"
 printf '  };\n\n'
 

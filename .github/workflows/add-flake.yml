@@ -98,59 +98,34 @@ jobs:
           fi
           echo "✓ flake.nix exists"
 
-      # ── Step 3: fetch + validate outputs.meta ────────────────────────────────
-      - name: Fetch and validate metadata
+      # ── Step 3: fetch outputs.meta (best-effort — add-flake.sh infers if absent) ─
+      - name: Fetch metadata
         id: meta
         env:
           FLAKE_URL: ${{ steps.parse.outputs.flake_url }}
+          REPO_NAME: ${{ steps.parse.outputs.repo_name }}
         run: |
           set -euo pipefail
 
-          echo "Fetching: nix eval ${FLAKE_URL}#meta --json"
+          # Default to repo name so steps below always have a usable name
+          FLAKE_NAME="$REPO_NAME"
+          META_JSON="{}"
+
+          echo "Attempting: nix eval ${FLAKE_URL}#meta --json"
           _nix_stderr="$(mktemp)"
-          if ! META_JSON="$(nix eval "${FLAKE_URL}#meta" --json 2>"$_nix_stderr")"; then
-            echo "::error::nix eval failed. Make sure the flake exports outputs.meta = { ... };"
-            cat "$_nix_stderr"
-            rm -f "$_nix_stderr"
-            exit 1
+          if META_JSON_RAW="$(nix eval "${FLAKE_URL}#meta" --json \
+              --extra-experimental-features 'nix-command flakes' 2>"$_nix_stderr")" \
+              && echo "$META_JSON_RAW" | jq -e . >/dev/null 2>&1; then
+            META_JSON="$META_JSON_RAW"
+            META_NAME="$(echo "$META_JSON" | jq -r '.name // empty')"
+            [[ -n "$META_NAME" ]] && FLAKE_NAME="$META_NAME"
+            echo "✓ outputs.meta found — name: $FLAKE_NAME"
+          else
+            echo "⚠ No outputs.meta found — add-flake.sh will infer metadata from GitHub"
           fi
           rm -f "$_nix_stderr"
 
-          # Sanity check: ensure we got valid JSON (not Nix warnings mixed in)
-          if ! echo "$META_JSON" | jq -e . >/dev/null 2>&1; then
-            echo "::error::nix eval output is not valid JSON. Got: $(echo "$META_JSON" | head -c 200)"
-            exit 1
-          fi
-          echo "✓ outputs.meta fetched"
-
-          # Validate required fields
-          REQUIRED=(name type role description status version)
-          for field in "${REQUIRED[@]}"; do
-            val="$(echo "$META_JSON" | jq -r --arg f "$field" '.[$f] // empty')"
-            if [[ -z "$val" ]]; then
-              echo "::error::meta.$field is missing or empty"
-              exit 1
-            fi
-          done
-          echo "✓ all required fields present"
-
-          # Validate allowed values
-          TYPE="$(echo "$META_JSON" | jq -r '.type')"
-          ROLE="$(echo "$META_JSON" | jq -r '.role')"
-          STATUS="$(echo "$META_JSON" | jq -r '.status')"
-
-          echo "library bundle module package app" | grep -qw "$TYPE" \
-            || { echo "::error::meta.type '$TYPE' is not valid (library|bundle|module|package|app)"; exit 1; }
-          echo "parent child standalone" | grep -qw "$ROLE" \
-            || { echo "::error::meta.role '$ROLE' is not valid (parent|child|standalone)"; exit 1; }
-          echo "experimental wip stable deprecated" | grep -qw "$STATUS" \
-            || { echo "::error::meta.status '$STATUS' is not valid (experimental|wip|stable|deprecated)"; exit 1; }
-          echo "✓ field values valid"
-
-          FLAKE_NAME="$(echo "$META_JSON" | jq -r '.name')"
           echo "name=$FLAKE_NAME" >> "$GITHUB_OUTPUT"
-
-          # Multiline output via delimiter
           {
             echo "meta<<METAEOF"
             echo "$META_JSON" | jq .
@@ -179,6 +154,7 @@ jobs:
           FAMILY: ${{ inputs.family }}
           DRY_RUN: ${{ inputs.dry_run }}
           FT_REPO_ROOT: ${{ github.workspace }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ARGS=(--non-interactive)
