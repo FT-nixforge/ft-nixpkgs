@@ -250,6 +250,40 @@ sort_versions() {
   ' <<< "$1" 2>/dev/null || printf '[]'
 }
 
+# Prune superseded major versions from a sorted JSON array of semver tags.
+#
+# Rule: keep ALL versions of the highest major; for every older major keep
+# only the single highest (latest) tag within that major.
+#
+# Examples:
+#   [3.1.0, 3.0.0, 2.3.0, 2.2.0, 1.5.0, 1.4.0]
+#     → [3.1.0, 3.0.0, 2.3.0, 1.5.0]
+#
+#   [2.3.0, 2.2.0, 1.5.0, 1.4.0, 1.3.0]
+#     → [2.3.0, 2.2.0, 1.5.0]
+#
+# Input must be a JSON array (output of sort_versions). Returns the input
+# unchanged on jq error or when there is only one major version.
+prune_old_major_versions() {
+  jq -c '
+    map(
+      . as $tag |
+      (sub("^v"; "") | split(".") | map(tonumber? // 0)) as $p |
+      {tag: $tag, major: ($p[0] // 0), minor: ($p[1] // 0), patch: ($p[2] // 0)}
+    ) as $parsed |
+    ($parsed | map(.major) | max // 0) as $top |
+    [
+      $parsed
+      | group_by(.major)[]
+      | if .[0].major == $top
+        then .[]
+        else sort_by(.minor, .patch) | last
+        end
+    ]
+    | sort_by(.major, .minor, .patch) | reverse | map(.tag)
+  ' <<< "$1" 2>/dev/null || printf '%s' "$1"
+}
+
 # Merge two JSON arrays of version tag strings, deduplicate, and sort newest-first.
 # Either argument may be missing or invalid — it is treated as [].
 merge_version_arrays() {
@@ -640,6 +674,10 @@ jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" \
     # Fall back to the meta list alone if merging produced invalid JSON
     jq -e 'type == "array"' <<< "$merged_versions" >/dev/null 2>&1 \
       || merged_versions="$(jq '.meta.versions // []' <<< "$entry")"
+
+    # Prune superseded major versions: for every major below the highest,
+    # keep only that major's single latest release.
+    merged_versions="$(prune_old_major_versions "$merged_versions")"
 
     # Check if this flake was bumped in step 5
     was_bumped=false
