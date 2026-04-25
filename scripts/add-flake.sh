@@ -118,7 +118,8 @@ else
   die "Cannot parse repo: '$RAW_INPUT'"
 fi
 
-FLAKE_URL="github:${OWNER}/${REPO_NAME}"
+FLAKE_REF="github:${OWNER}/${REPO_NAME}"
+FLAKE_URL="git+ssh://git@github.com/${OWNER}/${REPO_NAME}"
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO_NAME}/HEAD"
 
 echo ""
@@ -142,10 +143,10 @@ HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${RAW_BASE}/flake.nix")
 ok "flake.nix found"
 
 # ── Fetch metadata (or infer it when the flake has no outputs.meta) ───────────
-info "Fetching metadata via nix eval ${FLAKE_URL}#meta..."
+info "Fetching metadata via nix eval ${FLAKE_REF}#meta..."
 META_JSON=""
 _nix_err="$(mktemp)"
-if META_JSON_RAW="$(nix eval "${FLAKE_URL}#meta" --json \
+if META_JSON_RAW="$(nix eval "${FLAKE_REF}#meta" --json \
     --extra-experimental-features 'nix-command flakes' 2>"$_nix_err")" \
     && echo "$META_JSON_RAW" | jq -e . &>/dev/null; then
   META_JSON="$META_JSON_RAW"
@@ -183,7 +184,7 @@ if [[ -z "$META_JSON" ]]; then
   fi
 
   # Infer provides from nix flake show
-  if SHOW_JSON="$(nix flake show "${FLAKE_URL}" --json \
+  if SHOW_JSON="$(nix flake show "${FLAKE_REF}" --json \
       --extra-experimental-features 'nix-command flakes' 2>/dev/null)"; then
     PROVIDES="$(jq -c '[
       if has("packages")     then "packages"     else empty end,
@@ -199,7 +200,7 @@ if [[ -z "$META_JSON" ]]; then
     --arg type    "module" \
     --arg role    "standalone" \
     --arg desc    "$REPO_DESC" \
-    --arg repo    "github:${OWNER}/${REPO_NAME}" \
+    --arg repo    "$FLAKE_URL" \
     --arg version "$LATEST_VERSION" \
     --argjson provides "$PROVIDES" \
     '{
