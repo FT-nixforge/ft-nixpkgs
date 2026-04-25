@@ -16,7 +16,7 @@ flakes:
     role: standalone
     status: stable
     type: module
-    version: ''
+    version: 1.0.0
     versions:
     - v1.0.0
     - v0.1.0
@@ -32,7 +32,7 @@ flakes:
     role: parent
     status: stable
     type: library
-    version: ''
+    version: 1.5.0
     versions:
     - v1.5.0
     - v1.1.0
