@@ -1,0 +1,38 @@
+name: Check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            /nix/store
+            ~/.cache/nix
+          key: ${{ runner.os }}-nix-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nix-
+
+      - name: Check flake
+        run: nix flake check --show-trace
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "Flake check status: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
