@@ -165,14 +165,15 @@ fetch_upstream_tags() {
   done <<< "$refs"
 
   [[ ${#tags[@]} -eq 0 ]] && { printf '[]'; return; }
+  # -c (compact) keeps output on one line so it can be stored in a TSV column
   printf '%s\n' "${tags[@]}" | sort -u \
-    | jq -R -s 'split("\n") | map(select(length > 0))'
+    | jq -cR -s 'split("\n") | map(select(length > 0))'
 }
 
 # Filter a JSON array of tag strings to only strict semver tags: vX.Y.Z or X.Y.Z.
-# Prints the filtered array, or [] on error.
+# Prints a compact single-line JSON array, or [] on error.
 filter_semver_tags() {
-  jq '[.[] | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))]' <<< "$1" 2>/dev/null \
+  jq -c '[.[] | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))]' <<< "$1" 2>/dev/null \
     || printf '[]'
 }
 
