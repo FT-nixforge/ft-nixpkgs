@@ -14,6 +14,7 @@
 
 
 
+    ft-nixpalette.url = "github:FT-nixforge/ft-nixpalette";
     # ── Planned (uncomment when the repo is published) ──────────────────────
     # nixui.url     = "github:FT-nixforge/nixui";
     # nixbar.url    = "github:FT-nixforge/nixbar";
