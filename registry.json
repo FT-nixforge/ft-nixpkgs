@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "flakes": {
+    "ft-nixlaunch": {
+      "dependencies": [
+        "ft-nixpalette"
+      ],
+      "description": "Modern, polished Rofi application launcher for NixOS and Wayland",
+      "name": "ft-nixlaunch",
+      "provides": [
+        "packages",
+        "homeModules",
+        "overlays"
+      ],
+      "repo": "github:FT-nixforge/ft-nixlaunch",
+      "role": "standalone",
+      "type": "module",
+      "version": "1.0.0",
+      "family": null,
+      "versions": [
+        "v1.0.0",
+        "v0.1.0"
+      ]
+    }
+  },
+  "families": {}
+}
