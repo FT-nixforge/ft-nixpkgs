@@ -1,32 +1,59 @@
 #!/usr/bin/env bash
-# gen-registry.sh — Generate registry.json and registry.yaml from flakes/
+# gen-registry.sh — Build registry.json and registry.yaml from the flakes/ tree.
 #
-# Folder conventions:
-#   flakes/<name>/default.nix              standalone flake (no family)
-#   flakes/<family>/<name>/default.nix     family member flake
+# Each flake lives at one of two paths:
+#   flakes/<name>/default.nix               — standalone flake (no family)
+#   flakes/<family>/<member>/default.nix    — family member flake
+#
+# The script runs these steps in order:
+#   1. Discover all flake default.nix files.
+#   2. Evaluate each via nix-instantiate to extract the `meta` block.
+#      Results are cached by file-hash so unchanged flakes skip re-evaluation.
+#   3. Fetch all version tags from each flake's upstream git repo.
+#   4. (--check-updates only) Rewrite version / versions in .nix files when
+#      upstream has newer releases.
+#   5. Merge upstream semver tags into each entry's versions list.
+#   6. Assemble and write registry.json and registry.yaml.
 #
 # Usage:
-#   bash scripts/gen-registry.sh [--repo-root PATH] [--workers N] [--verbose]
+#   bash scripts/gen-registry.sh [OPTIONS]
+#
+# Options:
+#   --repo-root PATH   Path to the ft-nixpkgs repo root
+#                      (default: parent directory of this script)
+#   --workers N        Parallel nix-instantiate workers (default: 8)
+#   --check-updates    Fetch upstream tags and rewrite version/versions in
+#                      default.nix files when a newer release is found
+#   --verbose, -v      Print debug info (commands run, cache hits, byte counts)
+#   --help, -h         Show this help and exit
+
 set -uo pipefail
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+# Directories inside flakes/ that are never processed (e.g. scaffolding).
 EXCLUDED=("_template")
+
+# Bumped whenever the registry schema changes in a breaking way.
 SCHEMA_VERSION=1
+
+# Cache file path relative to REPO_ROOT. Keyed by absolute nix_path.
 CACHE_FILE=".registry-cache.json"
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
+# ── Argument defaults ──────────────────────────────────────────────────────────
+
 VERBOSE=false
 WORKERS=8
 REPO_ROOT=""
 CHECK_UPDATES=false
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
+# ── Usage ──────────────────────────────────────────────────────────────────────
 
 usage() {
   cat <<'EOF'
 Usage: gen-registry.sh [OPTIONS]
 
-Generate registry.json and registry.yaml from the flakes/ directory.
+Build registry.json and registry.yaml from the flakes/ directory.
 
 Folder conventions:
   flakes/<name>/default.nix              standalone flake (no family)
@@ -36,11 +63,14 @@ Options:
   --repo-root PATH   Path to the ft-nixpkgs repo root
                      (default: parent of this script's directory)
   --workers N        Number of parallel nix eval workers (default: 8)
-  --check-updates    Check upstream repos for newer versions and update default.nix files
-  --verbose, -v      Print debug info (nix eval commands, cache hits, byte counts)
+  --check-updates    Fetch upstream tags and rewrite version/versions in
+                     default.nix files when a newer release is available
+  --verbose, -v      Print debug info (commands, cache hits, byte counts)
   --help, -h         Show this help message and exit
 EOF
 }
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,325 +83,271 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Derived paths ─────────────────────────────────────────────────────────────
+# ── Derived paths ──────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -z "$REPO_ROOT" ]]; then
-  REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-fi
+[[ -z "$REPO_ROOT" ]] && REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 FLAKES_DIR="$REPO_ROOT/flakes"
 EVAL_NIX="$REPO_ROOT/scripts/eval-meta.nix"
 CACHE_FILE_PATH="$REPO_ROOT/$CACHE_FILE"
 
-# ── Sanity checks ─────────────────────────────────────────────────────────────
+# ── Pre-flight checks ──────────────────────────────────────────────────────────
 
-if [[ ! -d "$FLAKES_DIR" ]]; then
-  printf 'ERROR: flakes/ not found at %s\n' "$FLAKES_DIR" >&2
-  exit 1
-fi
-if [[ ! -f "$EVAL_NIX" ]]; then
-  printf 'ERROR: scripts/eval-meta.nix not found at %s\n' "$EVAL_NIX" >&2
-  exit 1
-fi
+[[ -d "$FLAKES_DIR" ]] || { printf 'ERROR: flakes/ not found at %s\n' "$FLAKES_DIR" >&2; exit 1; }
+[[ -f "$EVAL_NIX"   ]] || { printf 'ERROR: eval-meta.nix not found at %s\n' "$EVAL_NIX" >&2;   exit 1; }
 
-# ── Work directory (cleaned up on exit) ───────────────────────────────────────
+# ── Temp workspace (cleaned up on EXIT) ───────────────────────────────────────
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Utility functions
+# ══════════════════════════════════════════════════════════════════════════════
 
-vlog() {
-  if [[ "$VERBOSE" == true ]]; then
-    printf '  [verbose] %s\n' "$*" >&2
-  fi
-}
+# Print a debug line to stderr — only when --verbose is active.
+vlog() { [[ "$VERBOSE" == true ]] && printf '  [verbose] %s\n' "$*" >&2 || true; }
 
+# SHA-256 of a file. Works on Linux (sha256sum) and macOS (shasum -a 256).
 file_hash() {
-  local path="$1"
   if command -v sha256sum &>/dev/null; then
-    sha256sum "$path" | cut -d' ' -f1
+    sha256sum "$1" | cut -d' ' -f1
   else
-    shasum -a 256 "$path" | cut -d' ' -f1
+    shasum -a 256 "$1" | cut -d' ' -f1
   fi
 }
 
+# Return 0 (true) if $1 is in the EXCLUDED list.
 is_excluded() {
   local name="$1" excl
-  for excl in "${EXCLUDED[@]}"; do
-    [[ "$name" == "$excl" ]] && return 0
-  done
+  for excl in "${EXCLUDED[@]}"; do [[ "$name" == "$excl" ]] && return 0; done
   return 1
 }
 
-# Convert a flake reference like "github:owner/repo" to a git HTTPS URL.
+# ══════════════════════════════════════════════════════════════════════════════
+# Version helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Convert a Nix flake reference to a plain HTTPS git URL for git ls-remote.
+#
+#   github:owner/repo   →  https://github.com/owner/repo.git
+#   gitlab:owner/repo   →  https://gitlab.com/owner/repo.git
+#   sourcehut:~u/repo   →  https://git.sr.ht/~u/repo
+#   http(s)/git@ URLs   →  returned unchanged
 flake_ref_to_git_url() {
-  local ref="$1"
-  case "$ref" in
-    github:*)
-      local path="${ref#github:}"
-      printf 'https://github.com/%s.git' "$path"
-      ;;
-    gitlab:*)
-      local path="${ref#gitlab:}"
-      printf 'https://gitlab.com/%s.git' "$path"
-      ;;
-    sourcehut:*)
-      local path="${ref#sourcehut:}"
-      printf 'https://git.sr.ht/%s' "$path"
-      ;;
-    http:*|https:*|git@*)
-      printf '%s' "$ref"
-      ;;
-    *)
-      # Unknown format, return as-is and let git ls-remote fail gracefully
-      printf '%s' "$ref"
-      ;;
+  case "$1" in
+    github:*)    printf 'https://github.com/%s.git'  "${1#github:}"    ;;
+    gitlab:*)    printf 'https://gitlab.com/%s.git'  "${1#gitlab:}"    ;;
+    sourcehut:*) printf 'https://git.sr.ht/%s'       "${1#sourcehut:}" ;;
+    *)           printf '%s' "$1" ;;
   esac
 }
 
-# Fetch all version tags from upstream repo via git ls-remote.
-# Returns ALL tags as JSON array (deduplicated, sorted).
-# Returns empty array if repo is unreachable or has no tags.
+# Fetch every tag from a repo (flake ref or git URL) via git ls-remote.
+# Prints a JSON array of tag name strings (deduplicated, sorted).
+# Prints [] if git is unavailable, the repo is unreachable, or it has no tags.
 fetch_upstream_tags() {
-  local repo_url="$1"
-  repo_url="$(flake_ref_to_git_url "$repo_url")"
-
-  if ! command -v git &> /dev/null; then
-    printf '[]'
-    return 0
-  fi
+  local url
+  url="$(flake_ref_to_git_url "$1")"
+  command -v git &>/dev/null || { printf '[]'; return; }
 
   local refs
-  refs="$(git ls-remote --tags "$repo_url" 2>/dev/null || true)"
+  refs="$(git ls-remote --tags "$url" 2>/dev/null || true)"
+  [[ -z "$refs" ]] && { printf '[]'; return; }
 
-  if [[ -z "$refs" ]]; then
-    printf '[]'
-    return 0
-  fi
-
-  # Extract all tag names (excluding ^{} peel entries)
   local tags=()
   while IFS=$'\t' read -r _sha ref_name; do
-    local tag_name="${ref_name#refs/tags/}"
-    tag_name="${tag_name%^{}}"
-    [[ -n "$tag_name" ]] && tags+=("$tag_name")
+    # Strip refs/tags/ prefix and ^{} annotated-tag peel suffixes
+    local tag="${ref_name#refs/tags/}"
+    tag="${tag%^{}}"
+    [[ -n "$tag" ]] && tags+=("$tag")
   done <<< "$refs"
 
-  # Deduplicate and output as JSON array
-  if [[ ${#tags[@]} -eq 0 ]]; then
-    printf '[]'
-  else
-    printf '%s\n' "${tags[@]}" | sort -u | jq -R -s 'split("\n") | map(select(length > 0))'
-  fi
+  [[ ${#tags[@]} -eq 0 ]] && { printf '[]'; return; }
+  printf '%s\n' "${tags[@]}" | sort -u \
+    | jq -R -s 'split("\n") | map(select(length > 0))'
 }
 
-# Filter a JSON array of tags to only semver-like tags (vX.Y.Z or X.Y.Z).
-# Returns JSON array.
+# Filter a JSON array of tag strings to only strict semver tags: vX.Y.Z or X.Y.Z.
+# Prints the filtered array, or [] on error.
 filter_semver_tags() {
-  local json="$1"
-  jq '[.[] | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))]' <<< "$json" 2>/dev/null || echo '[]'
+  jq '[.[] | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))]' <<< "$1" 2>/dev/null \
+    || printf '[]'
 }
 
-# Given a JSON array of semver tags, return the newest one.
-# Returns empty string if no suitable tag found.
-newest_version() {
-  local versions_json="$1"
-  local best=""
-  local tag
-  while IFS= read -r tag; do
-    [[ -n "$tag" ]] || continue
-    if [[ -z "$best" ]] || ! semver_ge "$best" "$tag"; then
-      best="$tag"
-    fi
-  done < <(jq -r '.[]' <<< "$versions_json" 2>/dev/null)
-  printf '%s' "$best"
-}
-
-# Compare two semver strings (with optional v prefix).
-# Returns 0 if $1 >= $2, 1 otherwise.
-# Falls back to string comparison if either isn't semver-like.
+# Compare two semver strings (optional v prefix).
+# Returns 0 (success) if $1 >= $2, 1 (failure) if $1 < $2.
+# Falls back to lexicographic comparison for non-numeric inputs.
 semver_ge() {
   local a="${1#v}" b="${2#v}"
-  local a_major a_minor a_patch b_major b_minor b_patch
-  a_major="$(echo "$a" | cut -d. -f1)"
-  a_minor="$(echo "$a" | cut -d. -f2)"
-  a_patch="$(echo "$a" | cut -d. -f3)"
-  b_major="$(echo "$b" | cut -d. -f1)"
-  b_minor="$(echo "$b" | cut -d. -f2)"
-  b_patch="$(echo "$b" | cut -d. -f3)"
 
-  if [[ "$a_major" =~ ^[0-9]+$ && "$a_minor" =~ ^[0-9]+$ && "$a_patch" =~ ^[0-9]+$ && \
-        "$b_major" =~ ^[0-9]+$ && "$b_minor" =~ ^[0-9]+$ && "$b_patch" =~ ^[0-9]+$ ]]; then
-    if [[ "$a_major" -gt "$b_major" ]]; then return 0; fi
-    if [[ "$a_major" -lt "$b_major" ]]; then return 1; fi
-    if [[ "$a_minor" -gt "$b_minor" ]]; then return 0; fi
-    if [[ "$a_minor" -lt "$b_minor" ]]; then return 1; fi
-    if [[ "$a_patch" -gt "$b_patch" ]]; then return 0; fi
-    if [[ "$a_patch" -lt "$b_patch" ]]; then return 1; fi
-    return 0
-  else
-    [[ "$a" > "$b" || "$a" == "$b" ]]
+  # Fast path: both are pure semver — compare numerically part by part
+  if [[ "$a" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$b" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    local -i am="${a%%.*}" bm="${b%%.*}"
+    local arem="${a#*.}" brem="${b#*.}"
+    local -i an="${arem%%.*}" bn="${brem%%.*}"
+    local -i ap="${arem#*.}"  bp="${brem#*.}"
+
+    (( am != bm )) && { (( am > bm )) && return 0 || return 1; }
+    (( an != bn )) && { (( an > bn )) && return 0 || return 1; }
+    (( ap >= bp ))
+    return
   fi
+
+  # Slow path: lexicographic
+  [[ "$a" > "$b" || "$a" == "$b" ]]
 }
 
-# Given a JSON array of version tags, return the newest semver tag.
-# Prefers numeric tags over floating tags (stable, main, etc.).
-# Returns empty string if no suitable tag found.
+# Find the newest semver tag in a JSON array of tag strings.
+# Skips non-release labels (stable, beta, unstable, main, master).
+# Prints the winning tag, or nothing if the array is empty / has no semver tags.
 newest_version() {
-  local versions_json="$1"
-  local best=""
-  local tag
+  local best="" tag
   while IFS= read -r tag; do
-    [[ -n "$tag" ]] || continue
-    case "$tag" in
-      stable|beta|unstable|main|master) continue ;;
-    esac
+    [[ -z "$tag" ]] && continue
+    case "$tag" in stable|beta|unstable|main|master) continue ;; esac
     if [[ -z "$best" ]] || ! semver_ge "$best" "$tag"; then
       best="$tag"
     fi
-  done < <(jq -r '.[]' <<< "$versions_json" 2>/dev/null)
+  done < <(jq -r '.[]' <<< "$1" 2>/dev/null)
   printf '%s' "$best"
 }
 
-# Sort semver versions descending (newest first).
-# Input: JSON array of semver tags.
-# Output: JSON array sorted newest → oldest.
+# Sort a JSON array of semver tags newest-first.
+# Non-semver entries sort to the end (patch treated as 0).
+# Prints [] on invalid input.
 sort_versions() {
-  local json="$1"
-  # Validate input is a JSON array
-  if ! jq -e 'type == "array"' <<< "$json" >/dev/null 2>&1; then
-    echo '[]'
-    return
-  fi
-  # Use jq to sort by semver: extract numeric parts, compare descending
+  jq -e 'type == "array"' <<< "$1" >/dev/null 2>&1 || { printf '[]'; return; }
   jq '
     map(
       . as $tag |
-      (sub("^v"; "") | split(".") | map(tonumber)) as $parts |
-      {
-        tag: $tag,
-        major: ($parts[0] // 0),
-        minor: ($parts[1] // 0),
-        patch: ($parts[2] // 0)
-      }
-    ) |
-    sort_by(.major, .minor, .patch) |
-    reverse |
-    map(.tag)
-  ' <<< "$json" 2>/dev/null || echo '[]'
+      (sub("^v"; "") | split(".") | map(tonumber? // 0)) as $p |
+      {tag: $tag, major: ($p[0] // 0), minor: ($p[1] // 0), patch: ($p[2] // 0)}
+    )
+    | sort_by(.major, .minor, .patch) | reverse | map(.tag)
+  ' <<< "$1" 2>/dev/null || printf '[]'
 }
 
-# Merge two JSON arrays of versions, deduplicate, sort.
-# Args: old_json_array new_json_array
+# Merge two JSON arrays of version tag strings, deduplicate, and sort newest-first.
+# Either argument may be missing or invalid — it is treated as [].
 merge_version_arrays() {
-  local old_json="$1" new_json="$2"
+  local a="${1:-[]}" b="${2:-[]}"
+  jq -e 'type == "array"' <<< "$a" >/dev/null 2>&1 || a='[]'
+  jq -e 'type == "array"' <<< "$b" >/dev/null 2>&1 || b='[]'
+
   local merged
-  # Validate both inputs
-  if ! jq -e 'type == "array"' <<< "$old_json" >/dev/null 2>&1; then
-    old_json='[]'
-  fi
-  if ! jq -e 'type == "array"' <<< "$new_json" >/dev/null 2>&1; then
-    new_json='[]'
-  fi
-  merged="$(jq -s 'add | unique' <<< "$old_json$new_json" 2>/dev/null || echo '[]')"
-  if ! jq -e 'type == "array"' <<< "$merged" >/dev/null 2>&1; then
-    merged='[]'
-  fi
+  merged="$(jq -s 'add | unique' <<< "$a$b" 2>/dev/null || printf '[]')"
+  jq -e 'type == "array"' <<< "$merged" >/dev/null 2>&1 || merged='[]'
   sort_versions "$merged"
 }
 
-# Format a Nix list from a JSON array of strings.
-# Output is a single-line Nix list suitable for sed replacement.
+# Render a JSON array of strings as a single-line Nix list: [ "a" "b" "c" ]
+# Prints [] for an empty array.
 json_to_nix_list() {
-  local json="$1"
   local items
-  items="$(jq -r '.[]' <<< "$json" 2>/dev/null | sed 's/^/"/; s/$/"/' | paste -sd ' ' -)"
-  if [[ -z "$items" ]]; then
-    printf '[]'
-  else
-    printf '[ %s ]' "$items"
-  fi
+  items="$(jq -r '.[]' <<< "$1" 2>/dev/null \
+    | sed 's/^/"/; s/$/"/' | paste -sd ' ' -)"
+  [[ -z "$items" ]] && printf '[]' || printf '[ %s ]' "$items"
 }
 
-# Update version and versions in a default.nix file if newer versions are available.
-# Args: nix_path current_version current_versions_json upstream_versions_json newest_version
-# Returns 0 if file was modified, 1 otherwise.
-bump_version_in_nix() {
-  local nix_path="$1" current="$2" current_versions_json="$3" upstream_versions_json="$4" newest="$5"
-  local merged_versions merged_nix_list modified=false
+# ══════════════════════════════════════════════════════════════════════════════
+# Nix file version bumping
+# ══════════════════════════════════════════════════════════════════════════════
 
-  # Merge current and upstream versions
+# bump_version_in_nix NIX_PATH CURRENT_VER CURRENT_VERS_JSON UPSTREAM_VERS_JSON NEWEST_TAG
+#
+# Rewrites $1 in-place when either condition is true:
+#   a) The merged versions array contains new tags not already in the nix file.
+#   b) The newest upstream semver tag is greater than the current pinned version.
+#
+# Returns 0 if the file was modified, 1 if nothing changed.
+bump_version_in_nix() {
+  local nix_path="$1" current="$2" current_versions_json="$3"
+  local upstream_versions_json="$4" newest="$5"
+  local modified=false
+
+  local merged_versions
   merged_versions="$(merge_version_arrays "$current_versions_json" "$upstream_versions_json")"
 
-  # Update versions array if upstream added new tags
+  # ── Rewrite `versions = [ ... ];` when the merged list has grown ─────────────
   if [[ "$merged_versions" != "$current_versions_json" ]]; then
-    merged_nix_list="$(json_to_nix_list "$merged_versions")"
-    # Replace any versions = ... line (single-line or multi-line) with single-line list
-    if grep -q 'versions\s*=\s*\[' "$nix_path"; then
-      # Multi-line or single-line list
+    local nix_list
+    nix_list="$(json_to_nix_list "$merged_versions")"
+
+    if grep -q 'versions[[:space:]]*=[[:space:]]*\[' "$nix_path"; then
       if command -v perl >/dev/null 2>&1; then
-        perl -i -0777 -pe 's/versions\s*=\s*\[.*?\];/versions     = '"$merged_nix_list"';/s' "$nix_path"
+        # perl handles the multi-line `versions = [ ... ];` case cleanly
+        perl -i -0777 -pe \
+          's/versions\s*=\s*\[.*?\];/versions     = '"$nix_list"';/s' \
+          "$nix_path"
       else
-        # Fallback: use awk for multi-line replacement
+        # awk fallback: consume every line between `versions = [` and `];`
         awk '
-          /versions\s*=\s*\[/ { in_versions = 1 }
-          in_versions && /\];/ {
+          /versions[[:space:]]*=[[:space:]]*\[/ { in_block=1 }
+          in_block && /\];/ {
             print "    versions     = " merged ";"
-            in_versions = 0
-            next
+            in_block=0; next
           }
-          in_versions { next }
+          in_block { next }
           { print }
-        ' merged="$merged_nix_list" "$nix_path" > "$nix_path.tmp"
-        mv "$nix_path.tmp" "$nix_path"
+        ' merged="$nix_list" "$nix_path" > "$nix_path.tmp" \
+          && mv "$nix_path.tmp" "$nix_path"
       fi
     else
-      # Missing entirely: insert after version line
-      sed -i '/version\s*=\s*"[^"]*";/a\    versions     = '"$merged_nix_list"';' "$nix_path"
+      # No versions line present — insert one after `version = "...";`
+      sed -i '/version[[:space:]]*=[[:space:]]*"[^"]*";/a\    versions     = '"$nix_list"';' \
+        "$nix_path"
     fi
+
     printf '  [updated versions] %s\n' "$(basename "$(dirname "$nix_path")")"
     modified=true
   fi
 
-  # Always set main version to the newest available semver (strip v prefix)
+  # ── Rewrite `version = "...";` when upstream has a strictly newer release ───
   local newest_stripped="${newest#v}"
   local current_stripped="${current#v}"
   if [[ -n "$newest_stripped" && "$newest_stripped" != "$current_stripped" ]]; then
-    sed -i "s/version\s*=\s*\"$current\"/version = \"$newest_stripped\"/" "$nix_path"
-    printf '  [bumped version] %s: %s → %s\n' "$(basename "$(dirname "$nix_path")")" "$current" "$newest_stripped"
+    sed -i \
+      "s/version[[:space:]]*=[[:space:]]*\"$current\"/version      = \"$newest_stripped\"/" \
+      "$nix_path"
+    printf '  [bumped version] %s: %s → %s\n' \
+      "$(basename "$(dirname "$nix_path")")" "$current" "$newest_stripped"
     modified=true
   fi
 
-  if [[ "$modified" == true ]]; then
-    return 0
-  fi
-  return 1
+  [[ "$modified" == true ]] && return 0 || return 1
 }
 
-# Outputs lines of "family_or_empty|name|abs_nix_path", sorted.
-# Called via process substitution — runs in a subshell; nullglob is safe here.
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry discovery
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Emit lines of the form  "family|name|/abs/path/to/default.nix"  sorted.
+# family is empty string for standalone flakes.
+# Runs via process substitution so the nullglob change is scoped to this subshell.
 discover_entries() {
   shopt -s nullglob
-  local entries=() top_dir top_name top_nix child_dir child_name child_nix
+  local entries=()
 
   for top_dir in "$FLAKES_DIR"/*/; do
     [[ -d "$top_dir" ]] || continue
+    local top_name
     top_name="$(basename "$top_dir")"
     is_excluded "$top_name" && continue
-    top_nix="${top_dir}default.nix"
-    if [[ -f "$top_nix" ]]; then
-      entries+=( "|${top_name}|$(realpath "$top_nix")" )
+
+    if [[ -f "${top_dir}default.nix" ]]; then
+      # Standalone: flakes/<name>/default.nix
+      entries+=( "|${top_name}|$(realpath "${top_dir}default.nix")" )
     else
+      # Family: each sub-directory with a default.nix is a member
       for child_dir in "$top_dir"*/; do
         [[ -d "$child_dir" ]] || continue
+        local child_name
         child_name="$(basename "$child_dir")"
         is_excluded "$child_name" && continue
-        child_nix="${child_dir}default.nix"
-        if [[ -f "$child_nix" ]]; then
-          entries+=( "${top_name}|${child_name}|$(realpath "$child_nix")" )
-        fi
+        [[ -f "${child_dir}default.nix" ]] || continue
+        entries+=( "${top_name}|${child_name}|$(realpath "${child_dir}default.nix")" )
       done
     fi
   done
@@ -379,22 +355,29 @@ discover_entries() {
   printf '%s\n' "${entries[@]+"${entries[@]}"}" | sort
 }
 
-# Evaluate one entry; write a JSON result object to out_file.
-# Runs as a background job — must not write to stdout.
+# ══════════════════════════════════════════════════════════════════════════════
+# Nix evaluation  (always runs as a background job)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# eval_entry FAMILY NAME NIX_PATH OUT_FILE
+#
+# Evaluates NIX_PATH with nix-instantiate and writes one JSON object to OUT_FILE.
+#
+# On success:  {family, name, hash, nix_path, meta, cached: false}
+# Cache hit:   {family, name, hash, nix_path, meta, cached: true}
+# On failure:  {family, name, nix_path, error: "<message>"}
+#
+# Must not write to stdout — callers capture stdout for other purposes.
 eval_entry() {
   local family="$1" name="$2" nix_path="$3" out_file="$4"
-  local current_hash family_json cached_meta
+  local current_hash family_json
 
   current_hash="$(file_hash "$nix_path")"
+  family_json="$([ -n "$family" ] && jq -n --arg f "$family" '$f' || printf 'null')"
 
-  if [[ -n "$family" ]]; then
-    family_json="$(jq -n --arg f "$family" '$f')"
-  else
-    family_json="null"
-  fi
-
-  # ── Cache check ──────────────────────────────────────────────────────────
+  # ── Cache hit: skip nix-instantiate when the file hash is unchanged ──────────
   if [[ -f "$CACHE_FILE_PATH" ]]; then
+    local cached_meta
     cached_meta="$(jq -r \
       --arg key  "$nix_path" \
       --arg hash "$current_hash" \
@@ -403,6 +386,7 @@ eval_entry() {
        else ""
        end' \
       "$CACHE_FILE_PATH" 2>/dev/null || true)"
+
     if [[ -n "$cached_meta" && "$cached_meta" != "null" ]]; then
       vlog "cache hit: $nix_path"
       jq -n \
@@ -417,19 +401,24 @@ eval_entry() {
     fi
   fi
 
-  # ── Nix evaluation ───────────────────────────────────────────────────────
+  # ── Fresh evaluation via nix-instantiate ─────────────────────────────────────
+  # --strict forces deep evaluation so nested lists/attrs fully serialize to JSON
+  # (without it, unevaluated thunks cause "cannot convert a thunk to JSON" errors).
   local nix_stdout="${out_file}.stdout"
   local nix_stderr="${out_file}.stderr"
   local nix_exit=0
-  local cmd=("nix-instantiate" "--eval" "--strict" "--json" "$EVAL_NIX" "--arg" "flakePath" "$nix_path")
+  local cmd=(
+    nix-instantiate --eval --strict --json
+    "$EVAL_NIX" --arg flakePath "$nix_path"
+  )
 
   vlog "${cmd[*]}"
   "${cmd[@]}" >"$nix_stdout" 2>"$nix_stderr" || nix_exit=$?
 
   if [[ $nix_exit -ne 0 ]]; then
     local err_text
-    err_text="$(head -c 4096 "$nix_stderr" || true)"
-    [[ -n "$err_text" ]] || err_text="nix eval exited with code $nix_exit"
+    err_text="$(head -c 4096 "$nix_stderr" 2>/dev/null || true)"
+    [[ -n "$err_text" ]] || err_text="nix-instantiate exited with code $nix_exit"
     jq -n \
       --argjson family   "$family_json" \
       --arg     name     "$name" \
@@ -443,12 +432,12 @@ eval_entry() {
 
   local meta_json
   meta_json="$(cat "$nix_stdout")"
-  if ! jq -e . <<<"$meta_json" >/dev/null 2>&1; then
+  if ! jq -e . <<< "$meta_json" >/dev/null 2>&1; then
     jq -n \
       --argjson family   "$family_json" \
       --arg     name     "$name" \
       --arg     nix_path "$nix_path" \
-      --arg     error    "invalid JSON from nix eval" \
+      --arg     error    "nix-instantiate produced invalid JSON" \
       '{family:$family,name:$name,nix_path:$nix_path,error:$error}' \
       > "$out_file"
     rm -f "$nix_stdout" "$nix_stderr"
@@ -467,19 +456,28 @@ eval_entry() {
   rm -f "$nix_stdout" "$nix_stderr"
 }
 
-# ── Discovery ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — Discover flake entries
+# ══════════════════════════════════════════════════════════════════════════════
 
 echo "Scanning flakes/..."
 
 mapfile -t ENTRIES < <(discover_entries)
 
-# ── Parallel evaluation ───────────────────────────────────────────────────────
+if [[ ${#ENTRIES[@]} -eq 0 ]]; then
+  printf 'No flake entries found under %s\n' "$FLAKES_DIR" >&2
+  exit 1
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — Evaluate each entry in parallel (up to $WORKERS at once)
+# ══════════════════════════════════════════════════════════════════════════════
 
 OUT_FILES=()
 IDX=0
 RUNNING=0
 
-for ENTRY in "${ENTRIES[@]+"${ENTRIES[@]}"}"; do
+for ENTRY in "${ENTRIES[@]}"; do
   IFS='|' read -r ENTRY_FAMILY ENTRY_NAME ENTRY_NIX_PATH <<< "$ENTRY"
   ENTRY_OUT="$WORK_DIR/$(printf '%06d' $IDX).json"
   IDX=$(( IDX + 1 ))
@@ -488,151 +486,228 @@ for ENTRY in "${ENTRIES[@]+"${ENTRIES[@]}"}"; do
   eval_entry "$ENTRY_FAMILY" "$ENTRY_NAME" "$ENTRY_NIX_PATH" "$ENTRY_OUT" &
   RUNNING=$(( RUNNING + 1 ))
 
+  # Throttle: once we hit the worker limit, wait for one slot to free up
   if [[ $RUNNING -ge $WORKERS ]]; then
     wait -n 2>/dev/null || true
     RUNNING=$(( RUNNING - 1 ))
   fi
 done
 
-wait
+wait  # drain all remaining background jobs
 
-# ── Collect results ───────────────────────────────────────────────────────────
+# Merge every per-entry JSON file into a single array
+RESULTS_JSON="$(jq -s '.' "${OUT_FILES[@]}")"
 
-if [[ ${#OUT_FILES[@]} -eq 0 ]]; then
-  RESULTS_JSON="[]"
-else
-  RESULTS_JSON="$(jq -s '.' "${OUT_FILES[@]+"${OUT_FILES[@]}"}")"
-fi
-
-# ── Print per-entry status ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Print evaluation results and check for failures
+# ══════════════════════════════════════════════════════════════════════════════
 
 HAS_ERROR=false
 
-while IFS= read -r STATUS_LINE; do
-  printf '%s\n' "$STATUS_LINE"
-done < <(jq -r '.[] |
-  if .error then
-    "  [" + (if .family then .family + "/" else "" end) + .name + "] eval failed"
-  elif .cached then
-    "  [" + (if .family then .family + "/" else "" end) + .name + "] (cached)"
-  else
-    if .family then "  [" + .name + "] member of " + .family
-    else "  [" + .name + "] standalone"
-    end
-  end' <<< "$RESULTS_JSON")
+jq -r '.[] |
+  if   .error  then "  ✗ [" + (if .family then .family + "/" else "" end) + .name + "] eval failed"
+  elif .cached then "  ● [" + (if .family then .family + "/" else "" end) + .name + "] (cached)"
+  elif .family then "  ✓ [" + .name + "] member of " + .family
+  else              "  ✓ [" + .name + "] standalone"
+  end
+' <<< "$RESULTS_JSON"
 
 if jq -e '[.[] | select(.error)] | length > 0' <<< "$RESULTS_JSON" >/dev/null; then
   HAS_ERROR=true
 fi
 
-# ── Collect version tags from upstream repos ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — Fetch upstream version tags for every flake
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Writes a TSV file with one row per flake:
+#   name <TAB> all_tags_json <TAB> semver_tags_json
+#
+# This file is read later by both the --check-updates bump pass (step 5)
+# and the versions-merge pass (step 6).
 
 echo ""
 echo "Collecting upstream version tags..."
 
-# Build temporary versions file: name\tall_tags_json\tsemver_tags_json
-VERSIONS_FILE="$WORK_DIR/versions.txt"
+VERSIONS_FILE="$WORK_DIR/versions.tsv"
 {
-  jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.repo // "")' <<< "$RESULTS_JSON" | \
-  while IFS=$'\t' read -r flake_name repo_url; do
-    if [[ -n "$repo_url" ]]; then
-      all_tags="$(fetch_upstream_tags "$repo_url")"
-      semver_tags="$(filter_semver_tags "$all_tags")"
-      vlog "[$flake_name] found $(echo "$all_tags" | jq 'length') tags, $(echo "$semver_tags" | jq 'length') semver"
-    else
-      all_tags="[]"
-      semver_tags="[]"
-    fi
-    # Store: flake_name\tall_tags\tsemver_tags
-    printf '%s\t%s\t%s\n' "$flake_name" "$all_tags" "$semver_tags"
-  done
+  jq -r '.[] | select(.error == null) | [.name, (.meta.repo // "")] | @tsv' \
+    <<< "$RESULTS_JSON" \
+  | while IFS=$'\t' read -r flake_name repo_url; do
+      if [[ -n "$repo_url" ]]; then
+        all_tags="$(fetch_upstream_tags "$repo_url")"
+        semver_tags="$(filter_semver_tags "$all_tags")"
+        vlog "[$flake_name] $(jq 'length' <<< "$all_tags") total tags," \
+             "$(jq 'length' <<< "$semver_tags") semver"
+      else
+        all_tags='[]'
+        semver_tags='[]'
+      fi
+      printf '%s\t%s\t%s\n' "$flake_name" "$all_tags" "$semver_tags"
+    done
 } > "$VERSIONS_FILE"
 
-# ── Check for upstream version updates ────────────────────────────────────────
+# Look up the semver_tags JSON column for a given flake name.
+get_semver_tags() {
+  local result
+  result="$(grep "^${1}"$'\t' "$VERSIONS_FILE" | cut -f3)"
+  [[ -n "$result" ]] && printf '%s' "$result" || printf '[]'
+}
 
-# ── Check for upstream version updates ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — Bump version/versions in .nix files  (only with --check-updates)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Reads current version metadata from the eval results, compares against
+# upstream semver tags, and rewrites the .nix files in-place when the upstream
+# has new tags or a newer release. Collects bumped flake names for step 6.
 
 BUMPED_NAMES=()
 
 if [[ "$CHECK_UPDATES" == true ]]; then
   echo ""
   echo "Checking for upstream version updates..."
+
   while IFS=$'\t' read -r flake_name current_version current_versions_json nix_path; do
     [[ -n "$current_version" ]] || continue
-    # VERSIONS_FILE: name\tall_tags\tsemver_tags
-    semver_tags="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f3)"
-    [[ -n "$semver_tags" ]] || semver_tags='[]'
+    semver_tags="$(get_semver_tags "$flake_name")"
     newest="$(newest_version "$semver_tags")"
-    if bump_version_in_nix "$nix_path" "$current_version" "$current_versions_json" "$semver_tags" "$newest"; then
+    if bump_version_in_nix \
+        "$nix_path" "$current_version" "$current_versions_json" \
+        "$semver_tags" "$newest"; then
       BUMPED_NAMES+=("$flake_name")
     fi
-  done < <(jq -r '.[] | select(.error == null) | .name + "\t" + (.meta.version // "") + "\t" + (.meta.versions // "[]" | tojson) + "\t" + .nix_path' <<< "$RESULTS_JSON")
+  done < <(jq -r '.[] | select(.error == null) |
+      [.name, (.meta.version // ""), (.meta.versions // [] | tojson), .nix_path] | @tsv
+    ' <<< "$RESULTS_JSON")
 fi
 
-# Now merge versions into RESULTS_JSON by re-assembling it
-RESULTS_JSON_WITH_VERSIONS="[]"
-jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" | while read -r entry_b64; do
-  entry="$(echo "$entry_b64" | base64 -d)"
-  flake_name="$(echo "$entry" | jq -r '.name')"
-  # VERSIONS_FILE: name\tall_tags\tsemver_tags
-  semver_tags="$(grep "^${flake_name}\t" "$VERSIONS_FILE" | cut -f3)"
-  [[ -n "$semver_tags" ]] || semver_tags='[]'
-  # If this flake was bumped, also update version and versions in the JSON result
-  local was_bumped=false
-  for bumped in "${BUMPED_NAMES[@]}"; do
-    if [[ "$bumped" == "$flake_name" ]]; then
-      was_bumped=true
-      break
-    fi
-  done
-  if [[ "$was_bumped" == true ]]; then
-    newest="$(newest_version "$semver_tags")"
-    newest_stripped="${newest#v}"
-    merged_versions="$(merge_version_arrays "$(echo "$entry" | jq -r '.meta.versions // [] | tojson')" "$semver_tags")"
-    # Validate merged_versions before passing to jq
-    if jq -e 'type == "array"' <<< "$merged_versions" >/dev/null 2>&1; then
-      entry="$(echo "$entry" | jq --arg newest "$newest_stripped" --argjson merged "$merged_versions" '
-        .meta.version = $newest |
-        .meta.versions = $merged |
-        .versions = $merged
-      ')"
-    fi
-  else
-    # Use meta.versions if available, otherwise fall back to upstream semver tags
-    entry="$(echo "$entry" | jq --argjson upstream "$semver_tags" '
-      .versions = (.meta.versions // $upstream)
-    ')"
-  fi
-  echo "$entry" >> "$WORK_DIR/results_with_versions.tmp"
-done
-# Also add failed entries (with error field)
-jq '.[] | select(.error != null)' <<< "$RESULTS_JSON" >> "$WORK_DIR/results_with_versions.tmp"
-RESULTS_JSON="$(jq -s '.' "$WORK_DIR/results_with_versions.tmp")"
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — Merge upstream semver tags into each entry's versions field
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Every successful entry gets a `.versions` field equal to the union of:
+#   - The versions list from its .nix meta block
+#   - All semver-matching tags fetched from upstream in step 4
+#
+# For entries that were bumped in step 5, `.meta.version` is also updated in
+# the JSON result so the registry reflects the new version immediately — but
+# only when a non-empty newest tag was found (guards against wiping a real
+# version with an empty string when a repo has no semver tags at all).
+#
+# Note: this loop runs in a subshell (piped while-read). BUMPED_NAMES is
+# readable as an inherited copy; output goes to a tmp file, not a variable.
 
-# ── Save updated cache (atomic) ───────────────────────────────────────────────
+MERGED_TMP="$WORK_DIR/results_merged.tmp"
+: > "$MERGED_TMP"  # create the file so jq -s below always works
+
+jq -r '.[] | select(.error == null) | @base64' <<< "$RESULTS_JSON" \
+| while IFS= read -r entry_b64; do
+    entry="$(printf '%s' "$entry_b64" | base64 -d)"
+    flake_name="$(jq -r '.name' <<< "$entry")"
+    semver_tags="$(get_semver_tags "$flake_name")"
+
+    # Merge this entry's existing versions list with all upstream semver tags
+    merged_versions="$(merge_version_arrays \
+      "$(jq -r '.meta.versions // [] | tojson' <<< "$entry")" \
+      "$semver_tags")"
+    # Fall back to the meta list alone if merging produced invalid JSON
+    jq -e 'type == "array"' <<< "$merged_versions" >/dev/null 2>&1 \
+      || merged_versions="$(jq '.meta.versions // []' <<< "$entry")"
+
+    # Check if this flake was bumped in step 5
+    was_bumped=false
+    for bumped in "${BUMPED_NAMES[@]+"${BUMPED_NAMES[@]}"}"; do
+      [[ "$bumped" == "$flake_name" ]] && { was_bumped=true; break; }
+    done
+
+    if [[ "$was_bumped" == true ]]; then
+      newest="$(newest_version "$semver_tags")"
+      newest_stripped="${newest#v}"
+      if [[ -n "$newest_stripped" ]]; then
+        # Upstream has a concrete release — update both version and versions
+        entry="$(jq \
+          --arg     newest "$newest_stripped" \
+          --argjson merged "$merged_versions" \
+          '.meta.version = $newest | .meta.versions = $merged | .versions = $merged' \
+          <<< "$entry")"
+      else
+        # No semver tag found upstream — only update the versions list
+        entry="$(jq \
+          --argjson merged "$merged_versions" \
+          '.meta.versions = $merged | .versions = $merged' \
+          <<< "$entry")"
+      fi
+    else
+      # Entry was not bumped — just attach the merged versions list
+      entry="$(jq \
+        --argjson merged "$merged_versions" \
+        '.versions = $merged' \
+        <<< "$entry")"
+    fi
+
+    printf '%s\n' "$entry"
+  done >> "$MERGED_TMP"
+
+# Append failed entries unchanged — they carry an .error field and need no version data
+jq -c '.[] | select(.error != null)' <<< "$RESULTS_JSON" >> "$MERGED_TMP"
+
+RESULTS_JSON="$(jq -s '.' "$MERGED_TMP")"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — Save evaluation cache
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Cache maps nix_path → {hash, meta}. On the next run, entries whose file hash
+# hasn't changed skip nix-instantiate entirely (cache hit in eval_entry).
 
 NEW_CACHE="$(jq '
-  map(select(.error == null)) |
-  map({key: .nix_path, value: {hash: .hash, meta: .meta}}) |
-  from_entries
+  map(select(.error == null))
+  | map({key: .nix_path, value: {hash: .hash, meta: .meta}})
+  | from_entries
 ' <<< "$RESULTS_JSON")"
 
-TMP_CACHE="${CACHE_FILE_PATH}.tmp"
-printf '%s\n' "$NEW_CACHE" > "$TMP_CACHE"
-mv "$TMP_CACHE" "$CACHE_FILE_PATH"
-vlog "saved cache → $CACHE_FILE_PATH"
+printf '%s\n' "$NEW_CACHE" > "${CACHE_FILE_PATH}.tmp"
+mv "${CACHE_FILE_PATH}.tmp" "$CACHE_FILE_PATH"
+vlog "cache saved → $CACHE_FILE_PATH"
 
-# ── Assemble registry with jq ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8 — Assemble the registry
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Output schema:
+#   {
+#     schemaVersion: N,
+#     flakes: {
+#       "<name>": { ...meta fields..., family: null|"<family>", versions: [...] }
+#     },
+#     families: {
+#       "<family>": { parent: "<name>"|null, children: [...], description: "..." }
+#     }
+#   }
 
+echo ""
 echo "Writing registry files..."
 
 REGISTRY="$(jq -n \
-  --argjson schema   "$SCHEMA_VERSION" \
-  --argjson results  "$RESULTS_JSON" \
+  --argjson schema  "$SCHEMA_VERSION" \
+  --argjson results "$RESULTS_JSON" \
   '
+  # Only include successfully evaluated flakes
   ($results | map(select(.error == null))) as $ok |
-  ($ok | map({key: .name, value: (.meta + {family: .family, versions: (.versions // [])})}) | from_entries) as $flakes |
-  ($ok
+
+  # Flat flakes map: name → merged meta fields + family + versions
+  (
+    $ok | map({
+      key:   .name,
+      value: (.meta + {family: .family, versions: (.versions // [])})
+    }) | from_entries
+  ) as $flakes |
+
+  # Families map: family → { parent, children, description }
+  # A "parent" entry is the one with role == "parent"; everything else is a child.
+  (
+    $ok
     | map(select(.family != null))
     | group_by(.family)
     | map(
@@ -641,72 +716,70 @@ REGISTRY="$(jq -n \
         {
           key: $fname,
           value: {
-            parent: $parent,
-            children: (map(select(.meta.role? != "parent")) | map(.name) | map(select(. != $parent))),
+            parent:      $parent,
+            children:    (
+              map(select(.meta.role? != "parent")) | map(.name) | map(select(. != $parent))
+            ),
             description: (
-              if $parent != null and ($flakes[$parent] != null)
+              if $parent != null and $flakes[$parent] != null
               then ($flakes[$parent].description // $fname)
-              else $fname
-              end
+              else $fname end
             )
           }
         }
       )
     | from_entries
   ) as $families |
-  { schemaVersion: $schema, flakes: $flakes, families: $families }
+
+  {schemaVersion: $schema, flakes: $flakes, families: $families}
   ')"
 
-# ── Write registry.json (atomic) ──────────────────────────────────────────────
+# ── Write registry.json (atomic via tmp file) ─────────────────────────────────
 
 JSON_OUT="$REPO_ROOT/registry.json"
-TMP_JSON="${JSON_OUT}.tmp"
-printf '%s\n' "$REGISTRY" | jq '.' > "$TMP_JSON"
-mv "$TMP_JSON" "$JSON_OUT"
+printf '%s\n' "$REGISTRY" | jq '.' > "${JSON_OUT}.tmp"
+mv "${JSON_OUT}.tmp" "$JSON_OUT"
 printf '  Wrote %s\n' "$JSON_OUT"
-vlog "wrote $(wc -c < "$JSON_OUT") bytes → $JSON_OUT"
+vlog "$(wc -c < "$JSON_OUT") bytes"
 
-# ── Write registry.yaml (atomic, python3+pyyaml or JSON fallback) ─────────────
+# ── Write registry.yaml (atomic via tmp file) ─────────────────────────────────
+#
+# Uses PyYAML for human-friendly indented output when available.
+# Falls back to JSON-formatted YAML (valid YAML, just less readable).
+# Install python3-pyyaml to get the pretty version.
 
 YAML_OUT="$REPO_ROOT/registry.yaml"
-TMP_YAML="${YAML_OUT}.tmp"
-
-if python3 -c "import yaml" 2>/dev/null; then
-  {
-    printf '# Auto-generated by scripts/gen-registry.sh — do not edit manually.\n'
-    printf '# Source of truth: flakes/*/default.nix (meta block)\n\n'
+{
+  printf '# Auto-generated by scripts/gen-registry.sh — do not edit manually.\n'
+  printf '# Source of truth: flakes/*/default.nix (meta block)\n\n'
+  if python3 -c "import yaml" 2>/dev/null; then
     printf '%s\n' "$REGISTRY" | python3 -c "
 import sys, json, yaml
 data = json.load(sys.stdin)
 sys.stdout.write(yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False))
 "
-  } > "$TMP_YAML"
-  mv "$TMP_YAML" "$YAML_OUT"
-  printf '  Wrote %s\n' "$YAML_OUT"
-else
-  {
-    printf '# Auto-generated by scripts/gen-registry.sh — do not edit manually.\n'
-    printf '# Source of truth: flakes/*/default.nix (meta block)\n\n'
-    printf '# (PyYAML not available; output is JSON-formatted valid YAML)\n\n'
+  else
+    printf '# (PyYAML not available — output is JSON-formatted YAML)\n\n'
     printf '%s\n' "$REGISTRY" | jq '.'
-  } > "$TMP_YAML"
-  mv "$TMP_YAML" "$YAML_OUT"
-  printf '  Wrote %s (JSON fallback — install pyyaml for pretty YAML)\n' "$YAML_OUT"
-fi
-vlog "wrote $(wc -c < "$YAML_OUT") bytes → $YAML_OUT"
+  fi
+} > "${YAML_OUT}.tmp"
+mv "${YAML_OUT}.tmp" "$YAML_OUT"
+printf '  Wrote %s\n' "$YAML_OUT"
+vlog "$(wc -c < "$YAML_OUT") bytes"
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 9 — Summary and exit
+# ══════════════════════════════════════════════════════════════════════════════
 
-N_FLAKES="$(jq '.flakes | length' <<< "$REGISTRY")"
+N_FLAKES="$(jq '.flakes | length'   <<< "$REGISTRY")"
 N_FAMILIES="$(jq '.families | length' <<< "$REGISTRY")"
-
 printf '\nDone — %s flake(s), %s famil(ies).\n' "$N_FLAKES" "$N_FAMILIES"
 
 if [[ "$HAS_ERROR" == true ]]; then
   N_ERRORS="$(jq '[.[] | select(.error)] | length' <<< "$RESULTS_JSON")"
   printf '\n%s flake(s) failed to evaluate:\n' "$N_ERRORS" >&2
   jq -r '.[] | select(.error) |
-    "  \u2717 [" + (if .family then .family + "/" else "" end) + .name + "] eval failed: " + .error' \
-    <<< "$RESULTS_JSON" >&2
+    "  ✗ [" + (if .family then .family + "/" else "" end) + .name + "] " + .error
+  ' <<< "$RESULTS_JSON" >&2
   exit 1
 fi
