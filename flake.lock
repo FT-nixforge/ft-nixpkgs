@@ -146,11 +146,11 @@
         "stylix": "stylix"
       },
       "locked": {
-        "lastModified": 1777135277,
-        "narHash": "sha256-77fj7l9oVTW+qSKEAjRts0SKUCq9pAQPZT/qCaGEJ0U=",
+        "lastModified": 1777143751,
+        "narHash": "sha256-5TLOxH8dYp4jazehprXXGEIlnxoVaGsEa36SBEeihs0=",
         "owner": "FT-nixforge",
         "repo": "ft-nixpalette",
-        "rev": "88356770a837de4f430e4c06a684e3fb5c8e05c8",
+        "rev": "fd3894edc690d998a6fa184389fbf41e3eb29ca7",
         "type": "github"
       },
       "original": {
@@ -183,11 +183,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1777086106,
-        "narHash": "sha256-hlNpIN18pw3xo34Lsrp6vAMUPn0aB/zFBqL0QXI1Pmk=",
+        "lastModified": 1777138498,
+        "narHash": "sha256-mZdL0akv+PiA9h4DXNVGCqUeV5NiODy5lzRWoDsYhtI=",
         "owner": "nix-community",
         "repo": "home-manager",
-        "rev": "5826802354a74af18540aef0b01bc1320f82cc17",
+        "rev": "026e21038902970e54226133e718e8c197fac799",
         "type": "github"
       },
       "original": {
